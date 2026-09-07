@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.6 — MT5                                       |
+//| Wootang Scalper v8.7 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
@@ -95,11 +95,65 @@
 //  - Replaced StringFormat's "%I64d" specifier for the account-scoped
 //    global variable names with IntegerToString(), removing any
 //    dependency on that specifier's exact MQL5 support.
+//
+//  v8.7 fixes a further review pass, focused on trade-result
+//  confirmation, deal accounting, and restart persistence:
+//  - OnTradeTransaction() now calls HistoryDealSelect() before reading
+//    any deal property — without it, deal properties aren't reliably
+//    readable, which could have silently corrupted daily P/L and the
+//    losing-streak counter.
+//  - Every trade-modifying call (OrderDelete, PositionClose,
+//    PositionModify, not just BuyStop/SellStop) now verifies
+//    ResultRetcode() via a shared ConfirmTradeResult() helper, so a
+//    server-side rejection is visible instead of assumed successful.
+//  - GetBand()/VolatilityOk() now explicitly reject EMPTY_VALUE (an
+//    indicator's "not calculated yet" sentinel, ~1.8e308) — the v8.6
+//    fix only checked for 0, which doesn't catch this and could still
+//    have let a spurious BUY through on an uncalculated band value.
+//  - Daily P/L and the losing-streak counter are now computed per
+//    fully-closed POSITION (via HistorySelectByPosition, once
+//    PositionSelectByTicket confirms no volume remains), summing every
+//    deal's profit/swap/commission/fee — this captures entry-side
+//    commission that a per-exit-deal read would miss, and treats a
+//    partially-filled close as one trade result instead of several.
+//  - Fixed a broken resume path: deleting only the halt global
+//    variable left the old (high) peak in place, which could retrigger
+//    the halt on the very next tick since equity is virtually always
+//    still below that peak right after a halt. Clearing the halt now
+//    automatically rebases the peak to current equity.
+//  - The drawdown kill-switch now closes every position/order for this
+//    Magic number across ALL symbols immediately (CloseAllForMagic
+//    AccountWide()), instead of relying on every other chart to notice
+//    the shared halt flag on its own next tick.
+//  - Losing-streak/cooldown state is now persisted (keyed by
+//    symbol+magic) so a restart mid-cooldown doesn't silently resume
+//    trading.
+//  - Balance/credit deals (deposits, withdrawals, bonuses) are now
+//    detected and shift the equity peak by the same amount, so a
+//    withdrawal doesn't look like a trading drawdown and a deposit
+//    doesn't silently widen the drawdown cushion until equity
+//    organically grows into it.
+//  - Risk-based sizing now derives the loss-per-lot from
+//    OrderCalcProfit() instead of manual tick-value math, which is
+//    more accurate on instruments where contract specs make that math
+//    non-linear.
+//  - Entry/SL/TP/trailing prices are now normalized to
+//    SYMBOL_TRADE_TICK_SIZE, not just _Digits — some symbols have a
+//    tick size that's a multiple of the point size and would reject a
+//    price that merely looks correctly rounded.
+//  - Pending-order age (for PendingExpiryBars) is now measured in real
+//    bar indices via iBarShift(), not wall-clock seconds divided by
+//    the period — the old math overcounted "bars" across a weekend or
+//    other market closure.
+//  - Added OnInit() input validation (returns INIT_PARAMETERS_INCORRECT
+//    on an invalid combination) and seeded g_LastClosedEvalBars to the
+//    current bar count instead of 0, so attaching mid-candle in
+//    closed-bar mode doesn't evaluate a partially-elapsed bar.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.6"
+#property version   "8.7"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
@@ -164,7 +218,7 @@ int g_BandsHandle = INVALID_HANDLE;
 int g_ATRHandle   = INVALID_HANDLE;
 
 //--- bar trackers
-int g_LastBars          = 0; // intrabar mode: prevents multiple entries on the same bar
+int g_LastBars           = 0; // intrabar mode: prevents multiple entries on the same bar
 int g_LastClosedEvalBars = 0; // closed-bar mode: marks this bar's one evaluation opportunity as used
 
 //--- daily profit tracking
@@ -180,10 +234,13 @@ int    g_LastDay     = -1;
 double g_EquityPeak   = 0;
 string g_HaltVarName  = "";
 string g_PeakVarName  = "";
+bool   g_WasHalted    = false; // this instance's own last-seen halt state, to detect a manual clear
 
-//--- losing-streak cooldown
-int      g_ConsecutiveLosses = 0;
-datetime g_CooldownUntil     = 0;
+//--- losing-streak cooldown (persisted per symbol+magic — see OnInit)
+int      g_ConsecutiveLosses    = 0;
+datetime g_CooldownUntil        = 0;
+string   g_CooldownCountVarName = "";
+string   g_CooldownUntilVarName = "";
 
 //+------------------------------------------------------------------+
 //| Price helpers                                                     |
@@ -210,15 +267,32 @@ double GetMinStopDistance()
 }
 
 //+------------------------------------------------------------------+
+//| Round a price to the symbol's actual tradeable tick grid, not    |
+//| just its decimal digit count. Some symbols have a tick size that |
+//| is a MULTIPLE of the point size (e.g. Point=0.01, TickSize=0.05) |
+//| and will reject a price that merely looks correctly rounded to   |
+//| _Digits but doesn't land on an actual tick.                      |
+//+------------------------------------------------------------------+
+double NormalizeToTick(double price)
+{
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickSize <= 0) return NormalizeDouble(price, _Digits);
+    return NormalizeDouble(MathRound(price / tickSize) * tickSize, _Digits);
+}
+
+//+------------------------------------------------------------------+
 //| Read one Bollinger Band buffer value                              |
 //| buffer 1 = upper band,  buffer 2 = lower band                    |
 //| shift 0 = current (forming) bar, shift 1 = last closed bar       |
+//| Returns 0 on a failed read OR an EMPTY_VALUE (indicator hasn't    |
+//| calculated that bar yet) — callers treat both as "unavailable".  |
 //+------------------------------------------------------------------+
 double GetBand(int buffer, int shift = 0)
 {
     double buf[];
     ArraySetAsSeries(buf, true);
     if(CopyBuffer(g_BandsHandle, buffer, shift, 1, buf) != 1) return 0;
+    if(buf[0] == EMPTY_VALUE) return 0;
     return buf[0];
 }
 
@@ -242,6 +316,32 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
+//| A `true`/local-success return from a CTrade call only means the  |
+//| request passed local/client-side validation — it does NOT mean   |
+//| the broker actually accepted and executed it. Always check       |
+//| ResultRetcode() too, so a rejection (bad filling mode, invalid    |
+//| stops, insufficient margin, market restrictions) shows up as a   |
+//| clear log line instead of being silently assumed successful.     |
+//| Pass requireOrderTicket=true only for a pending-order PLACEMENT   |
+//| (BuyStop/SellStop), where ResultOrder()!=0 is meaningful.          |
+//+------------------------------------------------------------------+
+bool ConfirmTradeResult(const string label, bool localOk, bool requireOrderTicket = false)
+{
+    uint  retcode = trade.ResultRetcode();
+    ulong order   = trade.ResultOrder();
+    bool  ok      = localOk && (retcode == TRADE_RETCODE_DONE
+                              || retcode == TRADE_RETCODE_PLACED
+                              || retcode == TRADE_RETCODE_DONE_PARTIAL);
+    if(ok && requireOrderTicket && order == 0) ok = false;
+
+    if(!ok)
+        Print("Wootang v8: ", label, " NOT confirmed. localOk=", localOk,
+              " order=", order, " retcode=", retcode,
+              " (", trade.ResultRetcodeDescription(), ")");
+    return ok;
+}
+
+//+------------------------------------------------------------------+
 //| Cancel ALL pending orders for this EA (buy and sell stops).      |
 //| Called unconditionally before every new entry attempt so no      |
 //| stale orders from previous bars can accumulate.                  |
@@ -254,19 +354,17 @@ void DeleteAllPending()
            && ordInfo.Symbol() == _Symbol
            && ordInfo.Magic()  == Magic)
         {
-            if(!trade.OrderDelete(ordInfo.Ticket()))
-                Print("Wootang v8: OrderDelete failed for #", ordInfo.Ticket(),
-                      " err=", GetLastError());
+            bool ok = trade.OrderDelete(ordInfo.Ticket());
+            ConfirmTradeResult("OrderDelete #" + IntegerToString((long)ordInfo.Ticket()), ok);
         }
     }
 }
 
 //+------------------------------------------------------------------+
 //| Close all market positions and cancel all pending orders FOR THIS|
-//| SYMBOL+MAGIC instance. Used by the daily circuit breakers and by  |
-//| the drawdown kill-switch (each instance closes only its own      |
-//| trades; the halt flag itself is what makes the kill-switch        |
-//| account-wide — see UpdateDrawdownGuard/IsDrawdownHalted).         |
+//| SYMBOL+MAGIC instance. Used by the daily circuit breakers, and as |
+//| a per-instance safety net inside the drawdown halt path (the real |
+//| account-wide sweep is CloseAllForMagicAccountWide() below).      |
 //+------------------------------------------------------------------+
 void CloseAll()
 {
@@ -277,12 +375,43 @@ void CloseAll()
            && posInfo.Symbol() == _Symbol
            && posInfo.Magic()  == Magic)
         {
-            if(!trade.PositionClose(posInfo.Ticket()))
-                Print("Wootang v8: PositionClose failed for #", posInfo.Ticket(),
-                      " err=", GetLastError());
+            bool ok = trade.PositionClose(posInfo.Ticket());
+            ConfirmTradeResult("PositionClose #" + IntegerToString((long)posInfo.Ticket()), ok);
         }
     }
     DeleteAllPending();
+}
+
+//+------------------------------------------------------------------+
+//| Close every position and cancel every pending order belonging to |
+//| this EA's Magic number, across ALL symbols — not just _Symbol.   |
+//| Position/order functions in MQL5 aren't chart-scoped, so this is |
+//| safe to call from whichever instance first detects the breach.   |
+//| Used only by the drawdown kill-switch: a drawdown breach is an   |
+//| account-level event and should flatten everything immediately,   |
+//| not wait for every other chart to notice the shared halt flag on |
+//| its own next tick.                                                |
+//+------------------------------------------------------------------+
+void CloseAllForMagicAccountWide()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(!posInfo.SelectByIndex(i)) continue;
+        if(posInfo.Magic() != Magic) continue;
+
+        trade.SetTypeFillingBySymbol(posInfo.Symbol());
+        bool ok = trade.PositionClose(posInfo.Ticket());
+        ConfirmTradeResult("Account-wide PositionClose #" + IntegerToString((long)posInfo.Ticket()), ok);
+    }
+
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        if(!ordInfo.SelectByIndex(i)) continue;
+        if(ordInfo.Magic() != Magic) continue;
+
+        bool ok = trade.OrderDelete(ordInfo.Ticket());
+        ConfirmTradeResult("Account-wide OrderDelete #" + IntegerToString((long)ordInfo.Ticket()), ok);
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -309,45 +438,23 @@ void ApplyTrailingStop()
 
         if(posInfo.PositionType() == POSITION_TYPE_BUY)
         {
-            double newSL = NormalizeDouble(bid - trail, _Digits);
+            double newSL = NormalizeToTick(bid - trail);
             if(newSL > curSL && newSL > posInfo.PriceOpen())
             {
-                if(!trade.PositionModify(ticket, newSL, tp))
-                    Print("Wootang v8: trailing PositionModify failed for #", ticket,
-                          " err=", GetLastError());
+                bool ok = trade.PositionModify(ticket, newSL, tp);
+                ConfirmTradeResult("Trailing PositionModify #" + IntegerToString((long)ticket), ok);
             }
         }
         else if(posInfo.PositionType() == POSITION_TYPE_SELL)
         {
-            double newSL = NormalizeDouble(ask + trail, _Digits);
+            double newSL = NormalizeToTick(ask + trail);
             if((curSL == 0 || newSL < curSL) && newSL < posInfo.PriceOpen())
             {
-                if(!trade.PositionModify(ticket, newSL, tp))
-                    Print("Wootang v8: trailing PositionModify failed for #", ticket,
-                          " err=", GetLastError());
+                bool ok = trade.PositionModify(ticket, newSL, tp);
+                ConfirmTradeResult("Trailing PositionModify #" + IntegerToString((long)ticket), ok);
             }
         }
     }
-}
-
-//+------------------------------------------------------------------+
-//| A `true` return from trade.BuyStop()/SellStop() only means the   |
-//| request passed local/client-side validation — it does NOT mean   |
-//| the broker actually accepted and placed the order. Always check  |
-//| ResultRetcode()/ResultOrder() too, so a rejection (bad filling    |
-//| mode, invalid stops, insufficient margin, market restrictions)   |
-//| shows up as a clear log line instead of looking like "no signal".|
-//+------------------------------------------------------------------+
-void LogOrderResult(const string label, bool sent)
-{
-    uint  retcode = trade.ResultRetcode();
-    ulong order   = trade.ResultOrder();
-    bool  ok      = sent && order != 0
-                     && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED);
-    if(!ok)
-        Print("Wootang v8: ", label, " NOT confirmed placed. sent=", sent,
-              " order=", order, " retcode=", retcode,
-              " (", trade.ResultRetcodeDescription(), ")");
 }
 
 //+------------------------------------------------------------------+
@@ -368,7 +475,10 @@ bool PendingDistancesOk(double orderPrice, double sl, double tp, double currentP
 //+------------------------------------------------------------------+
 //| Today's realised profit from deal history — used only to seed/  |
 //| reseed g_DailyProfit on EA start and day rollover. Per-tick       |
-//| tracking is incremental via OnTradeTransaction.                  |
+//| tracking is incremental via OnTradeTransaction. Sums EVERY deal  |
+//| (entry and exit) for this symbol+magic today, excluding balance/ |
+//| credit operations, so it matches the per-position accounting     |
+//| OnTradeTransaction now uses.                                     |
 //+------------------------------------------------------------------+
 double GetDailyProfitFromHistory()
 {
@@ -381,13 +491,16 @@ double GetDailyProfitFromHistory()
     {
         ulong ticket = HistoryDealGetTicket(i);
         if(ticket == 0) continue;
-        if(HistoryDealGetString(ticket,  DEAL_SYMBOL) != _Symbol)        continue;
-        if(HistoryDealGetInteger(ticket, DEAL_MAGIC)  != (long)Magic)    continue;
-        if(HistoryDealGetInteger(ticket, DEAL_ENTRY)  != DEAL_ENTRY_OUT) continue;
+        if(HistoryDealGetString(ticket,  DEAL_SYMBOL) != _Symbol)     continue;
+        if(HistoryDealGetInteger(ticket, DEAL_MAGIC)  != (long)Magic) continue;
+
+        long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+        if(dealType == DEAL_TYPE_BALANCE || dealType == DEAL_TYPE_CREDIT) continue;
 
         total += HistoryDealGetDouble(ticket, DEAL_PROFIT)
                + HistoryDealGetDouble(ticket, DEAL_SWAP)
-               + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+               + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
+               + HistoryDealGetDouble(ticket, DEAL_FEE);
     }
     return total;
 }
@@ -411,18 +524,13 @@ void CheckDayRollover()
 //| global variables, keyed only by ACCOUNT_LOGIN (not by symbol or   |
 //| magic — see OnInit) — every chart running this EA under the SAME  |
 //| account reads the same halt flag and the same equity peak, so the |
-//| halt is genuinely account-wide. Each instance only ever closes    |
-//| its OWN (symbol+magic) trades via CloseAll() — it never reaches   |
-//| into another instance's positions directly; the shared flag is    |
-//| what makes every other instance halt itself too, on its own next  |
-//| tick. Keying by account prevents a halt/peak from one account     |
-//| leaking into a different account later logged into the same       |
-//| terminal instance (global variables aren't otherwise account-     |
-//| scoped).                                                            |
+//| halt is genuinely account-wide.                                   |
 //|                                                                    |
 //| The halt does NOT clear on an EA reload or terminal restart — MT5|
 //| global variables persist across both. Only deleting the global   |
-//| variable (Terminal -> Global Variables) clears it.                |
+//| variable (Terminal -> Global Variables) clears it — and clearing  |
+//| it automatically rebases the peak to current equity (see OnTick), |
+//| so resuming doesn't require separately resetting the peak too.   |
 //+------------------------------------------------------------------+
 bool IsDrawdownHalted()
 {
@@ -432,12 +540,13 @@ bool IsDrawdownHalted()
 void TriggerDrawdownHalt(double equity, double peak)
 {
     GlobalVariableSet(g_HaltVarName, 1.0);
-    CloseAll();
+    CloseAllForMagicAccountWide();
     Print("Wootang v8: *** ACCOUNT DRAWDOWN KILL-SWITCH TRIGGERED *** equity=", equity,
           " is more than ", MaxDrawdownPercent, "% below peak=", peak,
-          ". Trading is halted account-wide for every chart running this EA. ",
-          "This does NOT clear on an EA reload or terminal restart. After review, ",
-          "delete the global variable '", g_HaltVarName, "' (Terminal -> Global Variables) to resume.");
+          ". Every position/order for this Magic number across every symbol has been closed. ",
+          "This does NOT clear on an EA reload or terminal restart. After review, delete the ",
+          "global variable '", g_HaltVarName, "' (Terminal -> Global Variables) to resume — ",
+          "the equity peak rebases to current equity automatically the moment the halt clears.");
 }
 
 void UpdateDrawdownGuard()
@@ -463,8 +572,9 @@ void UpdateDrawdownGuard()
 }
 
 //+------------------------------------------------------------------+
-//| Losing-streak cooldown — updated from OnTradeTransaction as each |
-//| position for this EA closes.                                    |
+//| Losing-streak cooldown — updated from OnTradeTransaction once a  |
+//| position for this EA fully closes. Persisted (per symbol+magic)  |
+//| so a restart mid-cooldown doesn't silently resume trading.       |
 //+------------------------------------------------------------------+
 void RegisterClosedDealResult(double dealNetProfit)
 {
@@ -473,17 +583,22 @@ void RegisterClosedDealResult(double dealNetProfit)
     if(dealNetProfit < 0)
     {
         g_ConsecutiveLosses++;
+        GlobalVariableSet(g_CooldownCountVarName, g_ConsecutiveLosses);
+
         if(g_ConsecutiveLosses >= MaxConsecutiveLosses)
         {
             g_CooldownUntil = TimeCurrent() + CooldownMinutes * 60;
+            GlobalVariableSet(g_CooldownUntilVarName, (double)g_CooldownUntil);
             Print("Wootang v8: ", g_ConsecutiveLosses, " consecutive losses — new entries paused until ",
                   TimeToString(g_CooldownUntil, TIME_DATE | TIME_MINUTES));
             g_ConsecutiveLosses = 0;
+            GlobalVariableSet(g_CooldownCountVarName, 0);
         }
     }
     else if(dealNetProfit > 0)
     {
         g_ConsecutiveLosses = 0;
+        GlobalVariableSet(g_CooldownCountVarName, 0);
     }
 }
 
@@ -512,8 +627,8 @@ bool WithinSession()
 
 //+------------------------------------------------------------------+
 //| ATR volatility regime filter. Fails CLOSED (skips the trade) if  |
-//| the indicator buffer can't be read — better to sit out than to   |
-//| trade blind on a data hiccup.                                    |
+//| the indicator buffer can't be read, or hasn't been calculated    |
+//| yet (EMPTY_VALUE) — better to sit out than to trade blind.       |
 //+------------------------------------------------------------------+
 bool VolatilityOk()
 {
@@ -522,6 +637,7 @@ bool VolatilityOk()
     double atrBuf[];
     ArraySetAsSeries(atrBuf, true);
     if(CopyBuffer(g_ATRHandle, 0, 0, 1, atrBuf) != 1) return false;
+    if(atrBuf[0] == EMPTY_VALUE || atrBuf[0] <= 0) return false;
 
     double atrPoints = atrBuf[0] / _Point;
     if(MinATRPoints > 0 && atrPoints < MinATRPoints) return false;
@@ -531,7 +647,9 @@ bool VolatilityOk()
 
 //+------------------------------------------------------------------+
 //| Cancel any resting pending order for this EA that either:        |
-//|  (a) has been unfilled for PendingExpiryBars bars or more, or    |
+//|  (a) has been unfilled for PendingExpiryBars real bars or more   |
+//|      (measured by actual bar index via iBarShift, not wall-clock |
+//|      time — a weekend/closure gap doesn't count as elapsed bars),|
 //|  (b) no longer satisfies the same spread/ATR/session/cooldown    |
 //|      conditions a brand new entry would be required to pass.     |
 //| Runs every tick, independent of whether a fresh signal is firing |
@@ -540,7 +658,6 @@ bool VolatilityOk()
 //+------------------------------------------------------------------+
 void MaintainPendingOrders()
 {
-    int periodSeconds = PeriodSeconds(PERIOD_CURRENT);
     bool conditionsNowInvalid = (GetSpreadPoints() > Max_Spread)
                                  || !VolatilityOk()
                                  || !WithinSession()
@@ -552,27 +669,32 @@ void MaintainPendingOrders()
         if(ordInfo.Symbol() != _Symbol || ordInfo.Magic() != Magic) continue;
 
         bool ageExpired = false;
-        if(PendingExpiryBars > 0 && periodSeconds > 0)
+        if(PendingExpiryBars > 0)
         {
-            long ageSeconds = (long)(TimeCurrent() - ordInfo.TimeSetup());
-            ageExpired = (ageSeconds / periodSeconds) >= PendingExpiryBars;
+            int setupBarShift = iBarShift(_Symbol, PERIOD_CURRENT, ordInfo.TimeSetup(), false);
+            if(setupBarShift >= 0)
+                ageExpired = setupBarShift >= PendingExpiryBars;
         }
 
         if(ageExpired || conditionsNowInvalid)
         {
-            if(trade.OrderDelete(ordInfo.Ticket()))
+            bool ok = trade.OrderDelete(ordInfo.Ticket());
+            if(ConfirmTradeResult("Stale pending OrderDelete #" + IntegerToString((long)ordInfo.Ticket()), ok))
                 Print("Wootang v8: cancelled stale pending order #", ordInfo.Ticket(),
                       ageExpired ? " (age expired)" : " (filters no longer valid)");
-            else
-                Print("Wootang v8: OrderDelete failed for #", ordInfo.Ticket(),
-                      " err=", GetLastError());
         }
     }
 }
 
 //+------------------------------------------------------------------+
 //| Risk-based lot size: sized so a full StopLoss hit loses           |
-//| RiskPercent% of current equity.                                    |
+//| RiskPercent% of current equity. Uses OrderCalcProfit() (the       |
+//| broker/terminal's own pricing) rather than manual tick-value      |
+//| math, which can be inaccurate on instruments where contract specs |
+//| make that math non-linear (some CFDs/futures/cross-currency      |
+//| pairs). Modelled as a BUY moving slPoints against it; on          |
+//| virtually all FX/CFD instruments the loss magnitude for an        |
+//| equivalent adverse SELL move is the same.                        |
 //+------------------------------------------------------------------+
 double CalcRiskLots(double slPoints)
 {
@@ -581,12 +703,15 @@ double CalcRiskLots(double slPoints)
     double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
     double riskMoney = equity * (RiskPercent / 100.0);
 
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    if(tickValue <= 0 || tickSize <= 0) return 0;
+    double price      = GetAsk();
+    double closePrice = price - slPoints * _Point;
+    if(price <= 0 || closePrice <= 0) return 0;
 
-    double valuePerPoint = tickValue * (_Point / tickSize);
-    double lossPerLot    = slPoints * valuePerPoint;
+    double profitFor1Lot = 0;
+    if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, closePrice, profitFor1Lot))
+        return 0; // broker/terminal couldn't price it — skip rather than guess
+
+    double lossPerLot = MathAbs(profitFor1Lot);
     if(lossPerLot <= 0) return 0;
 
     return riskMoney / lossPerLot;
@@ -632,10 +757,44 @@ double LotsCalculation(double slPoints)
 }
 
 //+------------------------------------------------------------------+
+//| Basic sanity checks on inputs. Returns false (and OnInit returns  |
+//| INIT_PARAMETERS_INCORRECT) on an invalid combination, rather than |
+//| silently halting, trading nothing, or behaving strangely.        |
+//+------------------------------------------------------------------+
+bool ValidateInputs()
+{
+    if(Max_Spread <= 0)  { Print("Wootang v8: Max_Spread must be > 0"); return false; }
+    if(StopLoss <= 0)    { Print("Wootang v8: StopLoss must be > 0 (risk sizing and SL depend on it)"); return false; }
+    if(TakeProfit < 0)   { Print("Wootang v8: TakeProfit must be >= 0"); return false; }
+    if(TrailingStop < 0) { Print("Wootang v8: TrailingStop must be >= 0"); return false; }
+    if(PendingExpiryBars < 0) { Print("Wootang v8: PendingExpiryBars must be >= 0"); return false; }
+
+    if(SizingMode == SIZING_RISK_PERCENT && RiskPercent <= 0) { Print("Wootang v8: RiskPercent must be > 0"); return false; }
+    if(SizingMode == SIZING_FIXED_LOT && uLotsValue <= 0)     { Print("Wootang v8: uLotsValue must be > 0"); return false; }
+
+    if(DailyTarget_On && DailyProfitTarget <= 0)  { Print("Wootang v8: DailyProfitTarget must be > 0"); return false; }
+    if(DailyLoss_On && DailyLossLimit <= 0)       { Print("Wootang v8: DailyLossLimit must be > 0"); return false; }
+    if(MaxDrawdown_On && MaxDrawdownPercent <= 0) { Print("Wootang v8: MaxDrawdownPercent must be > 0"); return false; }
+
+    if(Cooldown_On && MaxConsecutiveLosses <= 0) { Print("Wootang v8: MaxConsecutiveLosses must be > 0"); return false; }
+    if(Cooldown_On && CooldownMinutes <= 0)      { Print("Wootang v8: CooldownMinutes must be > 0"); return false; }
+
+    if(UseATRFilter && ATRPeriod <= 0) { Print("Wootang v8: ATRPeriod must be > 0"); return false; }
+
+    if(UseSessionFilter && (SessionStartHour < 0 || SessionStartHour > 23)) { Print("Wootang v8: SessionStartHour must be 0-23"); return false; }
+    if(UseSessionFilter && (SessionEndHour   < 0 || SessionEndHour   > 23)) { Print("Wootang v8: SessionEndHour must be 0-23"); return false; }
+
+    return true;
+}
+
+//+------------------------------------------------------------------+
 //| OnInit                                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    if(!ValidateInputs())
+        return INIT_PARAMETERS_INCORRECT;
+
     trade.SetExpertMagicNumber(Magic);
     trade.SetDeviationInPoints(10);
     trade.SetTypeFillingBySymbol(_Symbol);
@@ -654,12 +813,14 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    g_LastBars           = 0;
-    g_LastClosedEvalBars = 0;
-    g_DailyProfit        = 0;
-    g_LastDay            = -1;
-    g_ConsecutiveLosses  = 0;
-    g_CooldownUntil      = 0;
+    g_LastBars = 0;
+    // Seed to the CURRENT bar rather than 0, so attaching mid-candle in
+    // closed-bar mode doesn't immediately evaluate a partially-elapsed
+    // bar — the first real evaluation happens at the start of the next
+    // fully-formed bar.
+    g_LastClosedEvalBars = iBars(_Symbol, PERIOD_CURRENT);
+    g_DailyProfit         = 0;
+    g_LastDay             = -1;
 
     // Global variables are shared by every program in this terminal instance
     // regardless of which account is logged in, so scope them to the current
@@ -671,12 +832,30 @@ int OnInit()
     double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
     g_EquityPeak = MathMax(storedPeak, AccountInfoDouble(ACCOUNT_EQUITY));
     GlobalVariableSet(g_PeakVarName, g_EquityPeak);
+    g_WasHalted = IsDrawdownHalted();
+
+    // Cooldown/streak state is per symbol+magic (unlike the account-wide
+    // drawdown halt) and persisted so a restart mid-cooldown doesn't
+    // silently resume trading.
+    g_CooldownCountVarName = "Wootang_ConsecLosses_" + _Symbol + "_" + IntegerToString(Magic);
+    g_CooldownUntilVarName = "Wootang_CooldownUntil_" + _Symbol + "_" + IntegerToString(Magic);
+    g_ConsecutiveLosses = GlobalVariableCheck(g_CooldownCountVarName) ? (int)GlobalVariableGet(g_CooldownCountVarName) : 0;
+    g_CooldownUntil     = GlobalVariableCheck(g_CooldownUntilVarName) ? (datetime)GlobalVariableGet(g_CooldownUntilVarName) : 0;
 
     if(IsDrawdownHalted())
         Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
               "'). No new trades will be placed until it is cleared.");
 
-    Print("Wootang Scalper v8.6 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+    if(InCooldown())
+        Print("Wootang v8: loaded mid-cooldown (restored from a previous session) — new entries paused until ",
+              TimeToString(g_CooldownUntil, TIME_DATE | TIME_MINUTES));
+
+    Print("Wootang v8: symbol digits=", _Digits, " point=", DoubleToString(_Point, _Digits),
+          " — StopLoss/TakeProfit/TrailingStop/offsets are in POINTS, not pips. Verify this matches ",
+          "your intended risk on this symbol (a 5-digit FX symbol's 500 points is 50 pips; a 3-digit ",
+          "JPY-style symbol's 500 points is 50 pips too, but check unusual symbols individually).");
+
+    Print("Wootang Scalper v8.7 started. TP=", TakeProfit, "pts  SL=", StopLoss,
           "pts  Trail=", TrailingStop, "pts  Sizing=",
           SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
                                              : "fixed lot " + DoubleToString(uLotsValue, 2),
@@ -695,8 +874,9 @@ void OnDeinit(const int reason)
 
 //+------------------------------------------------------------------+
 //| OnTradeTransaction — accumulate realised daily profit and track  |
-//| the losing-streak cooldown as deals close, instead of             |
-//| re-scanning the whole day's history every tick.                  |
+//| the losing-streak cooldown once a position for this EA fully     |
+//| closes, instead of re-scanning the whole day's history every     |
+//| tick.                                                             |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest      &request,
@@ -705,17 +885,65 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
     if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
     ulong dealTicket = trans.deal;
+    if(!HistoryDealSelect(dealTicket)) return; // properties aren't reliably readable otherwise
+
+    // Balance/credit operations (deposits, withdrawals, bonuses) aren't
+    // trades and don't carry this EA's symbol/magic. Handle them first so a
+    // withdrawal doesn't look like drawdown, and a deposit doesn't silently
+    // widen the drawdown cushion until equity organically grows into it.
+    long dealType = HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+    if(dealType == DEAL_TYPE_BALANCE || dealType == DEAL_TYPE_CREDIT)
+    {
+        double amount = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+        if(MaxDrawdown_On && amount != 0)
+        {
+            g_EquityPeak += amount;
+            if(g_EquityPeak < 0) g_EquityPeak = 0;
+            GlobalVariableSet(g_PeakVarName, g_EquityPeak);
+            Print("Wootang v8: balance operation of ", amount, " detected — equity peak adjusted to ", g_EquityPeak);
+        }
+        return;
+    }
+
     if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)        return;
     if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC)  != (long)Magic)    return;
     if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY)  != DEAL_ENTRY_OUT) return;
 
-    CheckDayRollover();
-    double dealNetProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
-                          + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
-                          + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-    g_DailyProfit += dealNetProfit;
+    // Only finalize once the position is fully flat — a partial close
+    // still leaves it open, and its final result isn't known yet.
+    long positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+    if(PositionSelectByTicket((ulong)positionId)) return;
 
-    RegisterClosedDealResult(dealNetProfit);
+    CheckDayRollover();
+
+    // Sum every deal tied to this position (entry + all exits): this is
+    // the only way to capture entry-side commission/fees and to treat a
+    // partially-filled close as one trade result, not several.
+    double positionNet = 0;
+    if(HistorySelectByPosition(positionId))
+    {
+        int deals = HistoryDealsTotal();
+        for(int i = 0; i < deals; i++)
+        {
+            ulong t = HistoryDealGetTicket(i);
+            if(t == 0) continue;
+            positionNet += HistoryDealGetDouble(t, DEAL_PROFIT)
+                         + HistoryDealGetDouble(t, DEAL_SWAP)
+                         + HistoryDealGetDouble(t, DEAL_COMMISSION)
+                         + HistoryDealGetDouble(t, DEAL_FEE);
+        }
+    }
+    else
+    {
+        // Fallback: at least count this one deal's own numbers.
+        positionNet = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+                    + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+                    + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
+                    + HistoryDealGetDouble(dealTicket, DEAL_FEE);
+    }
+
+    g_DailyProfit += positionNet;
+    RegisterClosedDealResult(positionNet);
 }
 
 //+------------------------------------------------------------------+
@@ -724,15 +952,32 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 void OnTick()
 {
     //--- drawdown kill-switch — checked first, overrides everything else.
-    //--- Even if ANOTHER chart/instance tripped it, make sure this
-    //--- instance's own trades are flat too.
-    if(IsDrawdownHalted())
+    //--- If the halt was active last tick but is gone now, a human just
+    //--- cleared it: rebase the peak to current equity so resuming
+    //--- doesn't immediately retrigger the halt (equity is virtually
+    //--- always still below the OLD peak right after a halt).
+    bool haltedNow = IsDrawdownHalted();
+    if(g_WasHalted && !haltedNow)
     {
-        CloseAll();
+        g_EquityPeak = AccountInfoDouble(ACCOUNT_EQUITY);
+        GlobalVariableSet(g_PeakVarName, g_EquityPeak);
+        Print("Wootang v8: drawdown halt cleared — equity peak rebased to current equity ", g_EquityPeak);
+    }
+
+    if(haltedNow)
+    {
+        g_WasHalted = true;
+        CloseAll(); // this instance's own trades; the trigger already swept everything by magic
         return;
     }
+
+    g_WasHalted = false;
     UpdateDrawdownGuard();
-    if(IsDrawdownHalted()) return; // just tripped this tick; CloseAll() already ran inside it
+    if(IsDrawdownHalted())
+    {
+        g_WasHalted = true;
+        return; // just tripped this tick; CloseAllForMagicAccountWide() already ran inside it
+    }
 
     //--- daily circuit breakers
     if(DailyTarget_On || DailyLoss_On)
@@ -763,8 +1008,8 @@ void OnTick()
     //--- that produced the signal actually closed. g_LastBars (used below)
     //--- is a separate tracker that keeps intrabar mode's own "at most once
     //--- per bar" dedup exactly as it was in v7.
-    int  currentBars       = iBars(_Symbol, PERIOD_CURRENT);
-    bool closedBarEvalNow  = false;
+    int  currentBars      = iBars(_Symbol, PERIOD_CURRENT);
+    bool closedBarEvalNow = false;
     if(EvaluateOnBarCloseOnly && g_LastClosedEvalBars != currentBars)
     {
         g_LastClosedEvalBars = currentBars;
@@ -828,14 +1073,14 @@ void OnTick()
 
     //--- Both bands are fetched upfront and validated together. This closes
     //--- a real gap in the original v7 SELL condition: GetBand() returns 0
-    //--- on a failed/insufficient-history read, and
-    //--- `(20pts + 0) >= Bid` is FALSE for any real price — meaning the
-    //--- "no signal" gate silently failed OPEN and would have placed a
-    //--- SellStop purely because the indicator read failed, not because of
-    //--- a real signal. The BUY side happened to fail closed by coincidence
-    //--- of its inequality direction, but is checked here too for symmetry
-    //--- and because closed-bar mode's iClose() reference can independently
-    //--- fail to 0 as well.
+    //--- on a failed/insufficient-history read or an EMPTY_VALUE (not yet
+    //--- calculated), and `(20pts + 0) >= Bid` is FALSE for any real price
+    //--- — meaning the "no signal" gate would silently fail OPEN and place
+    //--- a SellStop purely because the indicator read failed, not because
+    //--- of a real signal. The BUY side happened to fail closed by
+    //--- coincidence of its inequality direction, but is checked here too
+    //--- for symmetry and because closed-bar mode's iClose() reference can
+    //--- independently fail to 0 as well.
     double lowerBandRef = GetBand(2, EvaluateOnBarCloseOnly ? 1 : 0);
     double upperBandRef = GetBand(1, EvaluateOnBarCloseOnly ? 1 : 0);
     if(lowerBandRef <= 0 || upperBandRef <= 0)
@@ -861,9 +1106,9 @@ void OnTick()
         // Clean any stale pending orders unconditionally before placing
         DeleteAllPending();
 
-        double price = Ask + (_Point * 30);
-        double sl    = StopLoss   > 0 ? price - (StopLoss   * _Point) : 0;
-        double tp    = TakeProfit > 0 ? price + (TakeProfit * _Point) : 0;
+        double price = NormalizeToTick(Ask + (_Point * 30));
+        double sl    = StopLoss   > 0 ? NormalizeToTick(price - (StopLoss   * _Point)) : 0;
+        double tp    = TakeProfit > 0 ? NormalizeToTick(price + (TakeProfit * _Point)) : 0;
 
         if(!PendingDistancesOk(price, sl, tp, Ask))
         {
@@ -882,7 +1127,7 @@ void OnTick()
         trade.SetTypeFilling(ORDER_FILLING_RETURN); // pending orders: RETURN, not FOK/IOC
         bool sent = trade.BuyStop(lots, price, _Symbol, sl, tp,
                                    ORDER_TIME_GTC, 0, "Wootang Scalper v8");
-        LogOrderResult("BuyStop", sent);
+        ConfirmTradeResult("BuyStop", sent, true);
 
         g_LastBars = currentBars;
         return;
@@ -903,9 +1148,9 @@ void OnTick()
 
     if(Bid > (_Point * 50))
     {
-        double price = Bid - (_Point * 30);
-        double sl    = StopLoss   > 0 ? price + (StopLoss   * _Point) : 0;
-        double tp    = TakeProfit > 0 ? price - (TakeProfit * _Point) : 0;
+        double price = NormalizeToTick(Bid - (_Point * 30));
+        double sl    = StopLoss   > 0 ? NormalizeToTick(price + (StopLoss   * _Point)) : 0;
+        double tp    = TakeProfit > 0 ? NormalizeToTick(price - (TakeProfit * _Point)) : 0;
 
         if(!PendingDistancesOk(price, sl, tp, Bid))
         {
@@ -924,7 +1169,7 @@ void OnTick()
         trade.SetTypeFilling(ORDER_FILLING_RETURN); // pending orders: RETURN, not FOK/IOC
         bool sent = trade.SellStop(lots, price, _Symbol, sl, tp,
                                      ORDER_TIME_GTC, 0, "Wootang Scalper v8");
-        LogOrderResult("SellStop", sent);
+        ConfirmTradeResult("SellStop", sent, true);
     }
     g_LastBars = currentBars;
 }

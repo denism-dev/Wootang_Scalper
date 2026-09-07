@@ -203,3 +203,112 @@ previously-undetected bug, plus a small robustness improvement:
 None of this has been compiled or backtested — it's a structural read of
 the code, not a substitute for running it through MetaEditor and the
 Strategy Tester.
+
+## v8.7 — trade-result confirmation, deal accounting, restart persistence
+
+An external review of v8.6 surfaced 24 findings. Most held up; here's what
+changed and why:
+
+- **`OnTradeTransaction()` now calls `HistoryDealSelect()`** before reading
+  any deal property. Without it, deal properties from a ticket handed to
+  the EA by the transaction event (as opposed to one obtained by
+  enumerating an already-selected range) aren't reliably readable — this
+  could have silently corrupted daily P/L and the losing-streak counter.
+- **Every trade-modifying call now verifies `ResultRetcode()`**, not just
+  `BuyStop`/`SellStop`. `OrderDelete`, `PositionClose`, and
+  `PositionModify` all route through a shared `ConfirmTradeResult()`
+  helper, so a server-side rejection (e.g. the daily/drawdown breaker
+  believing a position closed when the broker actually rejected it) is
+  visible instead of assumed successful.
+- **`GetBand()`/`VolatilityOk()` now explicitly reject `EMPTY_VALUE`**
+  (`~1.8e308`, an indicator's "not calculated yet" sentinel). The v8.6 fix
+  only checked for `0`, which doesn't catch this — an uncalculated
+  Bollinger Band value could still have spuriously triggered a BUY.
+  Same class of gap in the ATR filter, now also closed.
+- **Daily P/L and the losing-streak counter are now computed per
+  fully-closed position**, not per exit deal. `OnTradeTransaction` waits
+  until `PositionSelectByTicket` confirms no volume remains, then sums
+  every deal for that `DEAL_POSITION_ID` (via `HistorySelectByPosition`)
+  — entry deal included. This captures entry-side commission a
+  per-exit-deal read would miss, and treats a partially-filled close as
+  one trade result instead of several.
+- **Fixed a broken resume path.** Deleting only the halt global variable
+  left the old (high) peak in place — since equity is virtually always
+  still below that peak right after a halt, the very next tick could
+  retrigger it immediately. Clearing the halt now automatically rebases
+  the peak to current equity.
+- **The drawdown kill-switch now closes everything immediately.**
+  `CloseAllForMagicAccountWide()` closes every position and cancels every
+  pending order for this Magic number across *all* symbols the instant the
+  breach is detected, instead of waiting for every other chart to notice
+  the shared halt flag on its own next tick.
+- **Cooldown/streak state is now persisted** (keyed by symbol+magic, via
+  global variables), so a restart mid-cooldown doesn't silently resume
+  trading.
+- **Balance/credit deals now shift the equity peak by the same amount.** A
+  withdrawal no longer looks like a trading drawdown, and a deposit
+  doesn't silently widen the drawdown cushion until equity organically
+  grows into it.
+- **Risk-based sizing now uses `OrderCalcProfit()`** instead of manual
+  tick-value math, which is more accurate on instruments where contract
+  specs make that math non-linear.
+- **Entry/SL/TP/trailing prices now normalize to
+  `SYMBOL_TRADE_TICK_SIZE`**, not just `_Digits` — some symbols have a
+  tick size that's a multiple of the point size and would reject a price
+  that merely looks correctly rounded.
+- **Pending-order age is now measured in real bar indices** (`iBarShift`),
+  not wall-clock seconds divided by the period — the old math overcounted
+  "bars" across a weekend or other market closure.
+- **Added `OnInit()` input validation** (returns
+  `INIT_PARAMETERS_INCORRECT` on an invalid combination) and seeded
+  `g_LastClosedEvalBars` to the current bar count instead of `0`, so
+  attaching mid-candle in closed-bar mode doesn't evaluate a
+  partially-elapsed bar.
+
+### Reviewed and NOT changed — here's why
+
+- **"The daily breaker isn't an explicit sticky latch."** In this specific
+  control flow it already behaves as one: once triggered, no new trades
+  can occur (entries are gated behind the same breaker check), so
+  `g_DailyProfit` cannot move back under the threshold on its own, and it
+  self-heals correctly across a restart via the history reseed in
+  `GetDailyProfitFromHistory()`. Adding an explicit latch would be
+  redundant state tracking the same thing this control flow already
+  guarantees.
+
+### Accepted, documented limitations (not fixed — disproportionate effort)
+
+- **Shared equity-peak updates aren't perfectly atomic.** Two instances
+  reading-then-writing the peak within the same instant could theoretically
+  let a lower value clobber a higher one. MQL5 has no compare-and-swap for
+  global variables; a real fix needs lock-like machinery for a failure mode
+  that's rare, low-impact (understates the peak by a small amount for at
+  most one tick), and self-corrects on the very next tick.
+- **Two chart instances with the same symbol+Magic will interfere** with
+  each other's pending orders and positions. This is a configuration
+  mistake to avoid (use a unique Magic per instance), not something the
+  code can safely detect and lock against without real heartbeat
+  machinery.
+
+### Open decisions — not changed, need your call
+
+These are real points, but each one changes actual trading/risk semantics
+rather than fixing a defect, so I'm not deciding them for you:
+
+- **Points vs. pips.** All offsets (`StopLoss`, `TakeProfit`,
+  `TrailingStop`, the 20/30/50-point signal offsets) are in raw points,
+  which represent different real amounts on different symbol digit
+  conventions. `OnInit` now logs the symbol's digits/point size so this is
+  at least visible, but converting the entry logic itself to pip-equivalent
+  would change v7's entry conditions, which every revision so far has
+  deliberately preserved.
+- **Daily limits are per symbol+Magic, not account-wide.** Running this on
+  four charts means up to four independent $200 targets / $100 limits, not
+  one shared account-wide pair. The drawdown kill-switch was made
+  account-wide because that was requested explicitly; the daily breakers
+  were never discussed the same way.
+- **1% risk is per trade, not total account exposure.** Four simultaneous
+  positions across four instances could put ~4% at risk, not 1%. A
+  portfolio-level open-risk cap needs the same kind of shared-state
+  coordination as the drawdown halt — worth building only if you actually
+  run multiple instances at once.
