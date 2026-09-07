@@ -155,3 +155,51 @@ gap, plus three live-trading robustness issues:
   names could let a halt or equity peak from one account leak into a
   different account later logged into the same terminal. They're now keyed
   by `ACCOUNT_LOGIN`.
+
+## v8.6 — general reliability pass
+
+A self-review focused on error handling and edge cases found one real,
+previously-undetected bug, plus a small robustness improvement:
+
+- **Fixed a fail-OPEN gap in the SELL condition.** `GetBand()` returns `0`
+  on a failed or insufficient-history read. The original SELL "no signal"
+  gate was `if((20pts + upperBand) >= Bid) return;` — if `upperBand` failed
+  to `0`, that check becomes `20pts >= Bid`, which is **false** for any real
+  price, so the gate would silently fail to trigger and the EA would place
+  a SellStop purely because the indicator read failed, not because of an
+  actual signal. This was present in the original v7 comparison itself, not
+  something introduced by any Wootang v8 revision — the BUY side happened
+  to fail closed by coincidence of its inequality direction, so it never
+  surfaced. Both bands (and, in closed-bar mode, the reference Close price,
+  plus Ask/Bid in all modes) are now validated as nonzero before either
+  signal is evaluated; a failed read now safely skips that tick instead of
+  risking a spurious entry.
+- **Removed a format-specifier dependency.** The account-scoped global
+  variable names built with `StringFormat("...%I64d", login)` now use
+  `IntegerToString(login)` instead, removing any reliance on that
+  specifier's exact behavior.
+
+### Other things worth knowing (not bugs, but worth understanding)
+
+- **The drawdown halt cannot be bypassed by toggling `MaxDrawdown_On`
+  off.** Once tripped, every chart running this EA — even one with
+  `MaxDrawdown_On=false` — will still see the shared halt flag and close
+  its own positions. Only deleting the global variable clears it. This is
+  intentional: a per-chart toggle should be able to opt out of *triggering*
+  the halt, never opt out of *honoring* one another instance already
+  triggered.
+- **`ORDER_FILLING_RETURN` is a convention, not a guarantee.** Some
+  brokers/symbols may still reject it for pending orders. If that happens,
+  it will now show up clearly via the v8.5 result-verification logging
+  rather than failing silently — that's the signal to try
+  `SetTypeFillingBySymbol()` for that symbol instead.
+- **`MaintainPendingOrders()` treats a transient ATR-read failure the same
+  as "ATR out of range."** A resting pending order can get cancelled on a
+  single bad tick of indicator data, not just on a genuine filter breach.
+  This is the deliberate cost of failing closed rather than trading blind,
+  but it's worth knowing the cancellation isn't always due to a real
+  volatility-regime change.
+
+None of this has been compiled or backtested — it's a structural read of
+the code, not a substitute for running it through MetaEditor and the
+Strategy Tester.

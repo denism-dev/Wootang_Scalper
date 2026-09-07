@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.5 — MT5                                       |
+//| Wootang Scalper v8.6 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
@@ -78,11 +78,28 @@
 //    so the previous unscoped names could let a halt/peak from one
 //    account leak into a different account later logged into the same
 //    terminal.
+//
+//  v8.6 fixes a self-review pass for general reliability:
+//  - Closed a real fail-OPEN gap in the SELL condition: GetBand()
+//    returns 0 on a failed/insufficient-history read, and
+//    `(20pts + 0) >= Bid` is false for any real price, so a failed
+//    indicator read would silently pass the "no signal" gate and
+//    place a SellStop that had nothing to do with an actual signal.
+//    This was present in the original v7 comparison, not something
+//    introduced by v8 — the BUY side happened to fail closed by
+//    coincidence of its inequality direction. Both bands (and, in
+//    closed-bar mode, the reference Close price, and Ask/Bid in all
+//    modes) are now validated as nonzero before either signal is
+//    evaluated; a failed read now safely skips the tick instead of
+//    risking a spurious entry.
+//  - Replaced StringFormat's "%I64d" specifier for the account-scoped
+//    global variable names with IntegerToString(), removing any
+//    dependency on that specifier's exact MQL5 support.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.5"
+#property version   "8.6"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
@@ -648,8 +665,8 @@ int OnInit()
     // regardless of which account is logged in, so scope them to the current
     // account login to avoid a halt/peak from one account leaking into another.
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    g_HaltVarName = StringFormat("Wootang_AccountHalt_%I64d", login);
-    g_PeakVarName = StringFormat("Wootang_AccountEquityPeak_%I64d", login);
+    g_HaltVarName = "Wootang_AccountHalt_" + IntegerToString(login);
+    g_PeakVarName = "Wootang_AccountEquityPeak_" + IntegerToString(login);
 
     double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
     g_EquityPeak = MathMax(storedPeak, AccountInfoDouble(ACCOUNT_EQUITY));
@@ -659,7 +676,7 @@ int OnInit()
         Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
               "'). No new trades will be placed until it is cleared.");
 
-    Print("Wootang Scalper v8.5 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+    Print("Wootang Scalper v8.6 started. TP=", TakeProfit, "pts  SL=", StopLoss,
           "pts  Trail=", TrailingStop, "pts  Sizing=",
           SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
                                              : "fixed lot " + DoubleToString(uLotsValue, 2),
@@ -786,6 +803,11 @@ void OnTick()
 
     double Ask = GetAsk();
     double Bid = GetBid();
+    if(Ask <= 0 || Bid <= 0)
+    {
+        Print("Wootang v8: Ask/Bid unavailable this tick — skipping signal evaluation");
+        return;
+    }
 
     //--- EvaluateOnBarCloseOnly toggle: when on, use the LAST CLOSED bar's
     //--- band and close price as the reference instead of the live/forming
@@ -793,8 +815,37 @@ void OnTick()
     //--- only changes when/what decides whether to place the order. Off by
     //--- default, which preserves the original intrabar v7 behaviour
     //--- exactly (buffer shift 0, live Ask/Bid).
+    double closedBarClose = 0;
+    if(EvaluateOnBarCloseOnly)
+    {
+        closedBarClose = iClose(_Symbol, PERIOD_CURRENT, 1);
+        if(closedBarClose <= 0)
+        {
+            Print("Wootang v8: closed-bar Close price unavailable this tick — skipping signal evaluation");
+            return;
+        }
+    }
+
+    //--- Both bands are fetched upfront and validated together. This closes
+    //--- a real gap in the original v7 SELL condition: GetBand() returns 0
+    //--- on a failed/insufficient-history read, and
+    //--- `(20pts + 0) >= Bid` is FALSE for any real price — meaning the
+    //--- "no signal" gate silently failed OPEN and would have placed a
+    //--- SellStop purely because the indicator read failed, not because of
+    //--- a real signal. The BUY side happened to fail closed by coincidence
+    //--- of its inequality direction, but is checked here too for symmetry
+    //--- and because closed-bar mode's iClose() reference can independently
+    //--- fail to 0 as well.
     double lowerBandRef = GetBand(2, EvaluateOnBarCloseOnly ? 1 : 0);
-    double buyRefPrice  = EvaluateOnBarCloseOnly ? iClose(_Symbol, PERIOD_CURRENT, 1) : Ask;
+    double upperBandRef = GetBand(1, EvaluateOnBarCloseOnly ? 1 : 0);
+    if(lowerBandRef <= 0 || upperBandRef <= 0)
+    {
+        Print("Wootang v8: Bollinger Band value unavailable this tick — skipping signal evaluation");
+        return;
+    }
+
+    double buyRefPrice  = EvaluateOnBarCloseOnly ? closedBarClose : Ask;
+    double sellRefPrice = EvaluateOnBarCloseOnly ? closedBarClose : Bid;
 
     // ── BUY SIGNAL ────────────────────────────────────────────────
     // Condition: reference price is below (lower band - 20 points) —
@@ -844,8 +895,6 @@ void OnTick()
     // SL: StopLoss points above entry price
     // TP: TakeProfit points below entry price
     // ── ENTRY LOGIC UNCHANGED FROM v7 (when EvaluateOnBarCloseOnly=false) ─
-    double upperBandRef = GetBand(1, EvaluateOnBarCloseOnly ? 1 : 0);
-    double sellRefPrice = EvaluateOnBarCloseOnly ? iClose(_Symbol, PERIOD_CURRENT, 1) : Bid;
     if(((_Point * 20) + upperBandRef) >= sellRefPrice) return;
     if(g_LastBars == currentBars) return;
 
