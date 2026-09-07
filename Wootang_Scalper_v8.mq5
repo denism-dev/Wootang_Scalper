@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.3 — MT5                                       |
+//| Wootang Scalper v8.4 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
@@ -38,17 +38,22 @@
 //    and payoff distribution. That's something to measure while
 //    testing, not something to promise in advance.
 //
-//  Still open, deliberately NOT changed here: whether the buy/sell
-//  condition should be evaluated only once per closed bar instead of
-//  intrabar (currently `g_LastBars != currentBars` only enforces "at
-//  most once per bar", not "only at bar open"). That's a strategy
-//  behaviour decision, not a bug fix, and entry conditions have been
-//  kept unchanged from v7 through every revision so far.
+//  v8.4 adds EvaluateOnBarCloseOnly (default OFF) as an explicit A/B
+//  toggle for the intrabar-vs-closed-bar question raised in review:
+//  originally, `g_LastBars != currentBars` only enforced "at most once
+//  per bar", not "only at bar open" — the signal could fire at any
+//  point intrabar. With the toggle OFF (default), that intrabar
+//  behaviour is preserved exactly, keeping entry conditions unchanged
+//  from v7. With it ON, the signal is evaluated once per bar using the
+//  last CLOSED bar's band and close price instead of the live/forming
+//  ones; order placement still uses live Ask/Bid either way. This
+//  materially changes trade timing/frequency versus v7 and is meant to
+//  be A/B tested in the Strategy Tester, not left on by default.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.3"
+#property version   "8.4"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
@@ -70,6 +75,7 @@ input int    StopLoss      = 500;                               // Stop Loss (po
 input int    TakeProfit    = 500;                               // Take Profit (points)
 input int    TrailingStop  = 25;                                 // Trailing Stop (points, 0 = off)
 input int    PendingExpiryBars = 2;                              // Cancel unfilled pending orders after N bars (0=never by age)
+input bool   EvaluateOnBarCloseOnly = false;                     // Evaluate the signal once on bar close instead of intrabar (see header notes)
 
 input string tsizing       = "== Position Sizing ==";          // ————————————————
 input ENUM_SIZING_MODE SizingMode = SIZING_RISK_PERCENT;        // How lot size is calculated
@@ -154,12 +160,13 @@ double GetMinStopDistance()
 //+------------------------------------------------------------------+
 //| Read one Bollinger Band buffer value                              |
 //| buffer 1 = upper band,  buffer 2 = lower band                    |
+//| shift 0 = current (forming) bar, shift 1 = last closed bar       |
 //+------------------------------------------------------------------+
-double GetBand(int buffer)
+double GetBand(int buffer, int shift = 0)
 {
     double buf[];
     ArraySetAsSeries(buf, true);
-    if(CopyBuffer(g_BandsHandle, buffer, 0, 1, buf) != 1) return 0;
+    if(CopyBuffer(g_BandsHandle, buffer, shift, 1, buf) != 1) return 0;
     return buf[0];
 }
 
@@ -584,10 +591,11 @@ int OnInit()
         Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
               "'). No new trades will be placed until it is cleared.");
 
-    Print("Wootang Scalper v8.3 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+    Print("Wootang Scalper v8.4 started. TP=", TakeProfit, "pts  SL=", StopLoss,
           "pts  Trail=", TrailingStop, "pts  Sizing=",
           SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
-                                             : "fixed lot " + DoubleToString(uLotsValue, 2));
+                                             : "fixed lot " + DoubleToString(uLotsValue, 2),
+          "  SignalMode=", EvaluateOnBarCloseOnly ? "closed-bar" : "intrabar");
     return INIT_SUCCEEDED;
 }
 
@@ -687,14 +695,29 @@ void OnTick()
     double Bid         = GetBid();
     int    currentBars = iBars(_Symbol, PERIOD_CURRENT);
 
+    //--- EvaluateOnBarCloseOnly toggle: when on, only evaluate the signal
+    //--- once, on the first tick of a new bar, using the LAST CLOSED bar's
+    //--- band and close price as the reference instead of the live/forming
+    //--- ones. Order placement still uses live Ask/Bid either way — this
+    //--- only changes when/what decides whether to place the order. Off by
+    //--- default, which preserves the original intrabar v7 behaviour
+    //--- exactly (buffer shift 0, live Ask/Bid).
+    if(EvaluateOnBarCloseOnly && g_LastBars == currentBars)
+        return;
+
+    double lowerBandRef = GetBand(2, EvaluateOnBarCloseOnly ? 1 : 0);
+    double buyRefPrice  = EvaluateOnBarCloseOnly ? iClose(_Symbol, PERIOD_CURRENT, 1) : Ask;
+
     // ── BUY SIGNAL ────────────────────────────────────────────────
-    // Condition: Ask is below (lower band - 20 points) on a new bar
-    // Entry: BuyStop placed 30 points above Ask
+    // Condition: reference price is below (lower band - 20 points) —
+    //   intrabar: live Ask vs the forming bar's band, checked every tick;
+    //   bar-close mode: last closed bar's Close vs its own band, checked
+    //   once per new bar.
+    // Entry: BuyStop placed 30 points above the CURRENT live Ask
     // SL: StopLoss points below entry price
     // TP: TakeProfit points above entry price
-    // ── ENTRY LOGIC UNCHANGED FROM v7 ────────────────────────────
-    double lowerBand = GetBand(2);
-    if(((lowerBand - (_Point * 20)) > Ask) && g_LastBars != currentBars)
+    // ── ENTRY LOGIC UNCHANGED FROM v7 (when EvaluateOnBarCloseOnly=false) ─
+    if(((lowerBandRef - (_Point * 20)) > buyRefPrice) && g_LastBars != currentBars)
     {
         // Clean any stale pending orders unconditionally before placing
         DeleteAllPending();
@@ -726,13 +749,15 @@ void OnTick()
     }
 
     // ── SELL SIGNAL ───────────────────────────────────────────────
-    // Condition: Bid is above (upper band + 20 points) on a new bar
-    // Entry: SellStop placed 30 points below Bid
+    // Condition: reference price is above (upper band + 20 points) —
+    //   same intrabar-vs-bar-close distinction as the buy signal above.
+    // Entry: SellStop placed 30 points below the CURRENT live Bid
     // SL: StopLoss points above entry price
     // TP: TakeProfit points below entry price
-    // ── ENTRY LOGIC UNCHANGED FROM v7 ────────────────────────────
-    double upperBand = GetBand(1);
-    if(((_Point * 20) + upperBand) >= Bid) return;
+    // ── ENTRY LOGIC UNCHANGED FROM v7 (when EvaluateOnBarCloseOnly=false) ─
+    double upperBandRef = GetBand(1, EvaluateOnBarCloseOnly ? 1 : 0);
+    double sellRefPrice = EvaluateOnBarCloseOnly ? iClose(_Symbol, PERIOD_CURRENT, 1) : Bid;
+    if(((_Point * 20) + upperBandRef) >= sellRefPrice) return;
     if(g_LastBars == currentBars) return;
 
     // Clean any stale pending orders unconditionally before placing

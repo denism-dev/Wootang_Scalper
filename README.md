@@ -95,9 +95,27 @@ A second review pass caught several gaps in v8.2 itself:
   expected to shift the observed win rate and payoff distribution. That's
   something to measure while testing, not something to promise in advance.
 
-**Deliberately not changed:** whether the buy/sell condition should be
-evaluated only once per closed bar instead of intrabar. `g_LastBars !=
-currentBars` only enforces "at most once per bar," not "only at bar open" —
-the signal can currently still fire mid-candle. That's a strategy-behaviour
-decision that materially affects backtest results, not a bug fix, so it's
-left for a deliberate choice rather than a silent change.
+**Deliberately not changed by default:** whether the buy/sell condition
+should be evaluated only once per closed bar instead of intrabar.
+`g_LastBars != currentBars` only enforces "at most once per bar," not "only
+at bar open" — the signal can fire mid-candle. That materially affects
+backtest results, so instead of silently picking one, v8.4 adds it as an
+explicit toggle (see below).
+
+## v8.4 — intrabar vs. closed-bar signal toggle
+
+`EvaluateOnBarCloseOnly` (default `false`) lets you A/B test the timing
+question above in the Strategy Tester instead of committing to one answer:
+
+- **Off (default):** unchanged from v7 — the signal can fire at any point
+  intrabar, checked on every tick against the live Ask/Bid and the
+  still-forming bar's band values.
+- **On:** the signal is evaluated once, on the first tick of a new bar,
+  using the last CLOSED bar's Bollinger Band values and its Close price as
+  the reference instead of the live/forming ones. Order placement still
+  uses the current live Ask/Bid either way — only the decision of *whether*
+  to place an order changes, not the price it's placed at.
+
+Turning it on changes trade timing and frequency versus v7, so it's meant
+to be compared against the default in testing, not assumed to be strictly
+better.
