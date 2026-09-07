@@ -1,46 +1,65 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.2 — MT5                                       |
+//| Wootang Scalper v8.3 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
-//  v8.2 adds a professional-grade risk layer on top of the v8.1 bug
-//  fixes. None of this changes — or can change — the strategy's win
-//  rate; a Bollinger-band breakout scalper wins something like 35-55%
-//  of the time depending on the market, and that is normal. What
-//  actually separates a survivable EA from one that blows up an
-//  account is risk control around that edge, which is what this
-//  revision adds:
+//  v8.3 fixes a review pass on the v8.2 risk layer:
 //
-//  - Risk-based position sizing: lot size is derived from % equity
-//    risked per trade against the actual StopLoss distance, instead
-//    of a fixed lot or a margin-percentage guess disconnected from
-//    real risk.
-//  - Daily loss limit: mirrors the existing daily profit target, but
-//    halts trading for the day once realised losses reach it.
-//  - Account drawdown kill-switch: if equity falls MaxDrawdownPercent
-//    below its peak, ALL trading halts immediately and stays halted
-//    (via a persistent global variable) until a human clears it —
-//    this will not silently resume on its own.
-//  - Losing-streak cooldown: after MaxConsecutiveLosses losses in a
-//    row, new entries pause for CooldownMinutes.
-//  - ATR volatility regime filter: skips entries when the market is
-//    too quiet (chop/whipsaw risk) or too violent (news-spike risk).
-//  - Session filter: restricts entries to a configured server-time
-//    window, avoiding illiquid hours and rollover spread widening.
+//  - Pending orders are now re-validated EVERY tick against spread,
+//    ATR, session and cooldown, and expire after PendingExpiryBars
+//    bars unfilled — regardless of whether a fresh signal has fired.
+//    Previously a resting GTC order could still execute even after
+//    the filters that would have blocked a *new* entry turned
+//    against it (e.g. spread widened, ATR went out of range, session
+//    ended, cooldown started) because the cleanup code only ran from
+//    inside a fresh-signal branch.
+//  - The drawdown kill-switch is now genuinely account-wide: the halt
+//    flag and the equity peak are shared global variables (not keyed
+//    by symbol/magic), so every chart running this EA sees the same
+//    halt and the same peak, while each instance only ever closes its
+//    own (symbol+magic) trades directly.
+//  - The equity peak is now persisted across EA/terminal restarts —
+//    previously it reset to current equity on every OnInit, which
+//    quietly lowered the drawdown bar after any restart.
+//  - Corrected the halt message: MT5 global variables survive a
+//    terminal restart, so restarting does NOT clear the halt. Only
+//    deleting the global variable does.
+//  - Risk-based sizing now SKIPS the trade when the calculated size
+//    rounds below the broker's minimum lot, instead of forcing it up
+//    to the minimum (which was silently risking more than requested).
+//  - Replaced the two independent UseRiskPercent/UsFixedLot booleans
+//    with a single SizingMode choice so they can't disagree.
+//  - Switched to SetTypeFillingBySymbol() instead of a hardcoded IOC,
+//    since some brokers/symbols reject IOC.
+//  - Corrected the header claim about win rate: position sizing alone
+//    can't change it, but the ATR/session filters, the cooldown, and
+//    the trailing stop all change which trades are taken and how they
+//    exit — they can and are expected to shift the observed win rate
+//    and payoff distribution. That's something to measure while
+//    testing, not something to promise in advance.
 //
-//  Trade entry conditions themselves remain unchanged from v7 — these
-//  are filters and sizing on top of the existing signal, not a new
-//  signal.
+//  Still open, deliberately NOT changed here: whether the buy/sell
+//  condition should be evaluated only once per closed bar instead of
+//  intrabar (currently `g_LastBars != currentBars` only enforces "at
+//  most once per bar", not "only at bar open"). That's a strategy
+//  behaviour decision, not a bug fix, and entry conditions have been
+//  kept unchanged from v7 through every revision so far.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.2"
+#property version   "8.3"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
+
+enum ENUM_SIZING_MODE
+{
+    SIZING_RISK_PERCENT, // Risk % of equity per trade (recommended)
+    SIZING_FIXED_LOT     // Fixed lot size
+};
 
 //--- core inputs
 input int    Max_Spread    = 20;                                // Max spread (points) to allow entries
@@ -50,12 +69,12 @@ input string trisk         = "== Risk Management ==";          // ————�
 input int    StopLoss      = 500;                               // Stop Loss (points)
 input int    TakeProfit    = 500;                               // Take Profit (points)
 input int    TrailingStop  = 25;                                 // Trailing Stop (points, 0 = off)
+input int    PendingExpiryBars = 2;                              // Cancel unfilled pending orders after N bars (0=never by age)
 
 input string tsizing       = "== Position Sizing ==";          // ————————————————
-input bool   UseRiskPercent = true;                             // Size by % equity risk (recommended)
-input double RiskPercent    = 1.0;                              // % equity risked per trade
-input bool   UsFixedLot     = false;                            // Fallback: use fixed lot size below
-input double uLotsValue     = 0.2;                              // Fixed lot size (only if UsFixedLot=true)
+input ENUM_SIZING_MODE SizingMode = SIZING_RISK_PERCENT;        // How lot size is calculated
+input double RiskPercent    = 1.0;                              // % equity risked per trade (SIZING_RISK_PERCENT)
+input double uLotsValue     = 0.2;                              // Fixed lot size (SIZING_FIXED_LOT)
 
 input string tdaily        = "== Daily Circuit Breakers ==";   // ————————————————
 input bool   DailyTarget_On    = true;                          // Stop for the day at profit target
@@ -64,8 +83,8 @@ input bool   DailyLoss_On       = true;                         // Stop for the 
 input double DailyLossLimit     = 100;                          // Daily loss limit ($, positive number)
 
 input string tdrawdown     = "== Account Drawdown Kill-Switch ==";  // ————————————————
-input bool   MaxDrawdown_On     = true;                        // Enable hard drawdown halt
-input double MaxDrawdownPercent = 10.0;                         // Halt ALL trading if equity falls this % below peak
+input bool   MaxDrawdown_On     = true;                        // Enable hard drawdown halt (account-wide)
+input double MaxDrawdownPercent = 10.0;                         // Halt if equity falls this % below its peak
 
 input string tstreak       = "== Losing-Streak Cooldown ==";   // ————————————————
 input bool   Cooldown_On          = true;                       // Enable cooldown after consecutive losses
@@ -99,9 +118,10 @@ int g_LastBars = 0;
 double g_DailyProfit = 0;
 int    g_LastDay     = -1;
 
-//--- drawdown kill-switch
-double g_EquityPeak  = 0;
-string g_HaltVarName  = "";
+//--- drawdown kill-switch (account-wide: shared, unkeyed global variables)
+double g_EquityPeak    = 0;
+string g_HaltVarName    = "Wootang_AccountHalt";
+string g_PeakVarName    = "Wootang_AccountEquityPeak";
 
 //--- losing-streak cooldown
 int      g_ConsecutiveLosses = 0;
@@ -147,9 +167,8 @@ double GetBand(int buffer)
 //| Returns true if this EA has an OPEN POSITION — the master        |
 //| one-trade lock. A resting pending order is NOT treated as an     |
 //| active trade: it is replaced by DeleteAllPending() the moment a  |
-//| fresh signal wants to place a new one (see OnTick), so at most   |
-//| one order is ever in play without the EA ever deadlocking on a   |
-//| stale pending.                                                   |
+//| fresh signal wants to place a new one (see OnTick), and is also  |
+//| independently expired/invalidated by MaintainPendingOrders().    |
 //+------------------------------------------------------------------+
 bool HasOpenPosition()
 {
@@ -184,8 +203,11 @@ void DeleteAllPending()
 }
 
 //+------------------------------------------------------------------+
-//| Close all market positions and cancel all pending orders.        |
-//| Used by the daily circuit breakers and the drawdown kill-switch. |
+//| Close all market positions and cancel all pending orders FOR THIS|
+//| SYMBOL+MAGIC instance. Used by the daily circuit breakers and by  |
+//| the drawdown kill-switch (each instance closes only its own      |
+//| trades; the halt flag itself is what makes the kill-switch        |
+//| account-wide — see UpdateDrawdownGuard/IsDrawdownHalted).         |
 //+------------------------------------------------------------------+
 void CloseAll()
 {
@@ -305,10 +327,18 @@ void CheckDayRollover()
 }
 
 //+------------------------------------------------------------------+
-//| Drawdown kill-switch. Uses a global variable (keyed by symbol +  |
-//| magic) so the halt SURVIVES an EA reload/reattach and only clears|
-//| when a human deletes it or the terminal restarts — this must not |
-//| silently resume on its own.                                      |
+//| Drawdown kill-switch. g_HaltVarName / g_PeakVarName are shared,  |
+//| UNKEYED global variables — every chart running this EA (whatever |
+//| its own symbol or magic) reads the same halt flag and the same   |
+//| equity peak, so the halt is genuinely account-wide. Each instance|
+//| only ever closes its OWN (symbol+magic) trades via CloseAll() —  |
+//| it never reaches into another instance's positions directly; the |
+//| shared flag is what makes every other instance halt itself too,  |
+//| on its own next tick.                                             |
+//|                                                                    |
+//| The halt does NOT clear on an EA reload or terminal restart — MT5|
+//| global variables persist across both. Only deleting the global   |
+//| variable (Terminal -> Global Variables) clears it.                |
 //+------------------------------------------------------------------+
 bool IsDrawdownHalted()
 {
@@ -319,19 +349,29 @@ void TriggerDrawdownHalt(double equity, double peak)
 {
     GlobalVariableSet(g_HaltVarName, 1.0);
     CloseAll();
-    Print("Wootang v8: *** DRAWDOWN KILL-SWITCH TRIGGERED *** equity=", equity,
+    Print("Wootang v8: *** ACCOUNT DRAWDOWN KILL-SWITCH TRIGGERED *** equity=", equity,
           " is more than ", MaxDrawdownPercent, "% below peak=", peak,
-          ". All trading halted. Delete global variable '", g_HaltVarName,
-          "' (or restart the terminal) after review to resume.");
+          ". Trading is halted account-wide for every chart running this EA. ",
+          "This does NOT clear on an EA reload or terminal restart. After review, ",
+          "delete the global variable '", g_HaltVarName, "' (Terminal -> Global Variables) to resume.");
 }
 
 void UpdateDrawdownGuard()
 {
     if(!MaxDrawdown_On) return;
 
+    // Pick up a higher peak recorded by another instance/session before this tick.
+    double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
+    if(storedPeak > g_EquityPeak) g_EquityPeak = storedPeak;
+
     double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-    if(equity > g_EquityPeak) g_EquityPeak = equity;
-    if(g_EquityPeak <= 0)     return;
+    if(equity > g_EquityPeak)
+    {
+        g_EquityPeak = equity;
+        GlobalVariableSet(g_PeakVarName, g_EquityPeak);
+    }
+
+    if(g_EquityPeak <= 0) return;
 
     double ddPercent = (g_EquityPeak - equity) / g_EquityPeak * 100.0;
     if(ddPercent >= MaxDrawdownPercent && !IsDrawdownHalted())
@@ -406,37 +446,102 @@ bool VolatilityOk()
 }
 
 //+------------------------------------------------------------------+
+//| Cancel any resting pending order for this EA that either:        |
+//|  (a) has been unfilled for PendingExpiryBars bars or more, or    |
+//|  (b) no longer satisfies the same spread/ATR/session/cooldown    |
+//|      conditions a brand new entry would be required to pass.     |
+//| Runs every tick, independent of whether a fresh signal is firing |
+//| — a resting GTC order must not be allowed to execute under       |
+//| conditions the EA itself currently flags as unsafe.               |
+//+------------------------------------------------------------------+
+void MaintainPendingOrders()
+{
+    int periodSeconds = PeriodSeconds(PERIOD_CURRENT);
+    bool conditionsNowInvalid = (GetSpreadPoints() > Max_Spread)
+                                 || !VolatilityOk()
+                                 || !WithinSession()
+                                 || InCooldown();
+
+    for(int i = OrdersTotal() - 1; i >= 0; i--)
+    {
+        if(!ordInfo.SelectByIndex(i)) continue;
+        if(ordInfo.Symbol() != _Symbol || ordInfo.Magic() != Magic) continue;
+
+        bool ageExpired = false;
+        if(PendingExpiryBars > 0 && periodSeconds > 0)
+        {
+            long ageSeconds = (long)(TimeCurrent() - ordInfo.TimeSetup());
+            ageExpired = (ageSeconds / periodSeconds) >= PendingExpiryBars;
+        }
+
+        if(ageExpired || conditionsNowInvalid)
+        {
+            if(trade.OrderDelete(ordInfo.Ticket()))
+                Print("Wootang v8: cancelled stale pending order #", ordInfo.Ticket(),
+                      ageExpired ? " (age expired)" : " (filters no longer valid)");
+            else
+                Print("Wootang v8: OrderDelete failed for #", ordInfo.Ticket(),
+                      " err=", GetLastError());
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
 //| Risk-based lot size: sized so a full StopLoss hit loses           |
-//| RiskPercent% of current equity. Falls back to a fixed lot when    |
-//| UseRiskPercent is off.                                             |
+//| RiskPercent% of current equity.                                    |
 //+------------------------------------------------------------------+
 double CalcRiskLots(double slPoints)
 {
-    if(slPoints <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    if(slPoints <= 0) return 0;
 
     double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
     double riskMoney = equity * (RiskPercent / 100.0);
 
     double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    if(tickValue <= 0 || tickSize <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    if(tickValue <= 0 || tickSize <= 0) return 0;
 
     double valuePerPoint = tickValue * (_Point / tickSize);
     double lossPerLot    = slPoints * valuePerPoint;
-    if(lossPerLot <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    if(lossPerLot <= 0) return 0;
 
     return riskMoney / lossPerLot;
 }
 
+//+------------------------------------------------------------------+
+//| Returns 0 to mean "skip this trade" — callers must check for it. |
+//| In SIZING_RISK_PERCENT mode, a size that rounds below the        |
+//| broker's minimum lot is skipped rather than forced up to the     |
+//| minimum, which would silently risk more than RiskPercent asks.   |
+//| In SIZING_FIXED_LOT mode the user's chosen size is clamped to the |
+//| broker's limits as normal.                                        |
+//+------------------------------------------------------------------+
 double LotsCalculation(double slPoints)
 {
-    double lots = UseRiskPercent ? CalcRiskLots(slPoints) : uLotsValue;
-
     double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
     double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    if(lotStep > 0)
-        lots = MathFloor(lots / lotStep) * lotStep;
+
+    if(SizingMode == SIZING_RISK_PERCENT)
+    {
+        double lots = CalcRiskLots(slPoints);
+        if(lots <= 0) return 0;
+        if(lotStep > 0) lots = MathFloor(lots / lotStep) * lotStep;
+
+        if(lots < minLot)
+        {
+            Print("Wootang v8: risk-based size ", DoubleToString(lots, 2),
+                  " is below broker minimum ", DoubleToString(minLot, 2),
+                  " for ", DoubleToString(RiskPercent, 2), "% risk — skipping trade rather than over-risking");
+            return 0;
+        }
+        if(lots > maxLot) lots = maxLot;
+        return lots;
+    }
+
+    // SIZING_FIXED_LOT — user-specified size, clamp to broker limits
+    double lots = uLotsValue;
+    if(lotStep > 0) lots = MathFloor(lots / lotStep) * lotStep;
     if(lots < minLot) lots = minLot;
     if(lots > maxLot) lots = maxLot;
     return lots;
@@ -449,7 +554,7 @@ int OnInit()
 {
     trade.SetExpertMagicNumber(Magic);
     trade.SetDeviationInPoints(10);
-    trade.SetTypeFilling(ORDER_FILLING_IOC);
+    trade.SetTypeFillingBySymbol(_Symbol);
 
     g_BandsHandle = iBands(_Symbol, PERIOD_CURRENT, 20, 0, 2, PRICE_CLOSE);
     if(g_BandsHandle == INVALID_HANDLE)
@@ -466,20 +571,23 @@ int OnInit()
     }
 
     g_LastBars          = 0;
-    g_DailyProfit        = 0;
-    g_LastDay            = -1;
-    g_ConsecutiveLosses  = 0;
-    g_CooldownUntil      = 0;
-    g_EquityPeak         = AccountInfoDouble(ACCOUNT_EQUITY);
-    g_HaltVarName        = StringFormat("Wootang_Halt_%s_%d", _Symbol, Magic);
+    g_DailyProfit       = 0;
+    g_LastDay           = -1;
+    g_ConsecutiveLosses = 0;
+    g_CooldownUntil     = 0;
+
+    double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
+    g_EquityPeak = MathMax(storedPeak, AccountInfoDouble(ACCOUNT_EQUITY));
+    GlobalVariableSet(g_PeakVarName, g_EquityPeak);
 
     if(IsDrawdownHalted())
-        Print("Wootang v8: loaded with an ACTIVE drawdown halt ('", g_HaltVarName,
+        Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
               "'). No new trades will be placed until it is cleared.");
 
-    Print("Wootang Scalper v8.2 started. TP=", TakeProfit, "pts  SL=", StopLoss,
-          "pts  Trail=", TrailingStop, "pts  Risk=",
-          UseRiskPercent ? DoubleToString(RiskPercent, 2) + "%" : "fixed lot " + DoubleToString(uLotsValue, 2));
+    Print("Wootang Scalper v8.3 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+          "pts  Trail=", TrailingStop, "pts  Sizing=",
+          SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
+                                             : "fixed lot " + DoubleToString(uLotsValue, 2));
     return INIT_SUCCEEDED;
 }
 
@@ -522,9 +630,16 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    //--- drawdown kill-switch — checked first, overrides everything else
+    //--- drawdown kill-switch — checked first, overrides everything else.
+    //--- Even if ANOTHER chart/instance tripped it, make sure this
+    //--- instance's own trades are flat too.
+    if(IsDrawdownHalted())
+    {
+        CloseAll();
+        return;
+    }
     UpdateDrawdownGuard();
-    if(IsDrawdownHalted()) return;
+    if(IsDrawdownHalted()) return; // just tripped this tick; CloseAll() already ran inside it
 
     //--- daily circuit breakers
     if(DailyTarget_On || DailyLoss_On)
@@ -548,8 +663,13 @@ void OnTick()
 
     //--- one-trade lock: block new entries only while a position is
     //--- actually open. A resting pending order does NOT block this —
-    //--- it gets replaced below the moment a fresh signal fires.
+    //--- it gets replaced below the moment a fresh signal fires, and is
+    //--- independently policed by MaintainPendingOrders() every tick.
     if(HasOpenPosition()) return;
+
+    //--- unconditionally re-validate/expire any resting pending order,
+    //--- regardless of whether a new entry is about to be evaluated
+    MaintainPendingOrders();
 
     //--- losing-streak cooldown
     if(InCooldown()) return;
@@ -591,6 +711,12 @@ void OnTick()
         }
 
         double lots = LotsCalculation(StopLoss);
+        if(lots <= 0)
+        {
+            g_LastBars = currentBars;
+            return; // sizing said skip — see LotsCalculation()
+        }
+
         if(!trade.BuyStop(lots, price, _Symbol, sl, tp,
                            ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
             Print("Wootang v8: BuyStop failed err=", GetLastError());
@@ -626,6 +752,12 @@ void OnTick()
         }
 
         double lots = LotsCalculation(StopLoss);
+        if(lots <= 0)
+        {
+            g_LastBars = currentBars;
+            return; // sizing said skip — see LotsCalculation()
+        }
+
         if(!trade.SellStop(lots, price, _Symbol, sl, tp,
                             ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
             Print("Wootang v8: SellStop failed err=", GetLastError());

@@ -43,10 +43,9 @@ survives the losing streaks that are guaranteed to happen along the way:
   daily profit target.
 - **Account drawdown kill-switch** (`MaxDrawdown_On`, `MaxDrawdownPercent`):
   if equity falls the configured % below its peak, all trading halts
-  immediately via a persistent global variable (`Wootang_Halt_<symbol>_<magic>`)
-  and stays halted — including across an EA reload — until a human deletes
-  that global variable or restarts the terminal. It will not silently
-  resume on its own.
+  immediately via a persistent global variable and stays halted — including
+  across an EA reload — until a human deletes that global variable. It will
+  not silently resume on its own.
 - **Losing-streak cooldown** (`Cooldown_On`, `MaxConsecutiveLosses`,
   `CooldownMinutes`): pauses new entries for a cooldown period after N
   losses in a row.
@@ -58,3 +57,47 @@ survives the losing streaks that are guaranteed to happen along the way:
 
 These are filters and sizing layered on top of the existing signal — the
 entry conditions themselves are still untouched from v7.
+
+## v8.3 — review fixes on the v8.2 risk layer
+
+A second review pass caught several gaps in v8.2 itself:
+
+- **Pending orders now re-validated every tick.** Previously, a resting
+  `ORDER_TIME_GTC` pending order could still execute even after the spread,
+  ATR, session, or cooldown filters that would block a *new* entry turned
+  against it, because the stale-order cleanup only ran from inside a
+  fresh-signal branch. `MaintainPendingOrders()` now runs unconditionally
+  every tick and cancels a resting order if it no longer satisfies those
+  same filters, or has been unfilled for `PendingExpiryBars` bars.
+- **Drawdown kill-switch is now genuinely account-wide.** The halt flag and
+  the equity peak are shared, unkeyed global variables (`Wootang_AccountHalt`,
+  `Wootang_AccountEquityPeak`) rather than per-symbol/magic ones — every
+  chart running this EA sees the same halt and the same peak. Each instance
+  still only ever closes its own trades directly; the shared flag is what
+  propagates the halt to every other instance on its own next tick.
+- **Equity peak now persists across restarts.** It previously reset to
+  current equity on every `OnInit`, which quietly lowered the drawdown bar
+  after any restart — defeating the point of a peak-based guard.
+- **Corrected the halt message.** MT5 global variables survive a terminal
+  restart; only deleting the global variable clears the halt. The old
+  message incorrectly implied a restart would also clear it.
+- **Risk-based sizing now skips instead of over-risking.** If the calculated
+  size rounds below the broker's minimum lot, the trade is skipped rather
+  than bumped up to the minimum — which could silently risk several times
+  the requested `RiskPercent`.
+- **Sizing is now one choice, not two conflicting booleans.** `SizingMode`
+  (risk % or fixed lot) replaces the old `UseRiskPercent`/`UsFixedLot` pair.
+- **Filling mode now auto-detected** via `SetTypeFillingBySymbol()` instead
+  of a hardcoded `ORDER_FILLING_IOC`, which some brokers/symbols reject.
+- **Corrected the win-rate claim.** Position sizing alone can't change win
+  rate, but the ATR/session filters, the cooldown, and the trailing stop all
+  change which trades are taken and how they exit — they can and are
+  expected to shift the observed win rate and payoff distribution. That's
+  something to measure while testing, not something to promise in advance.
+
+**Deliberately not changed:** whether the buy/sell condition should be
+evaluated only once per closed bar instead of intrabar. `g_LastBars !=
+currentBars` only enforces "at most once per bar," not "only at bar open" —
+the signal can currently still fire mid-candle. That's a strategy-behaviour
+decision that materially affects backtest results, not a bug fix, so it's
+left for a deliberate choice rather than a silent change.
