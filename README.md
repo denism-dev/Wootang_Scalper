@@ -26,3 +26,35 @@ pending order. This revision:
   instead of re-scanning the full day's deal history on every tick.
 
 Trade entry conditions themselves are unchanged from v7.
+
+## v8.2 risk-management layer
+
+No EA can guarantee a win rate — a Bollinger-band breakout scalper wins
+somewhere in the 35-55% range depending on the market, and that's normal.
+What v8.2 adds is the risk control that determines whether an account
+survives the losing streaks that are guaranteed to happen along the way:
+
+- **Risk-based position sizing** (`UseRiskPercent`, `RiskPercent`): lot size
+  is derived from % equity risked against the actual `StopLoss` distance,
+  replacing the old margin-percentage guess that wasn't tied to real risk.
+  `UsFixedLot` remains as a fallback.
+- **Daily loss limit** (`DailyLoss_On`, `DailyLossLimit`): halts trading for
+  the day once realised losses reach the limit, mirroring the existing
+  daily profit target.
+- **Account drawdown kill-switch** (`MaxDrawdown_On`, `MaxDrawdownPercent`):
+  if equity falls the configured % below its peak, all trading halts
+  immediately via a persistent global variable (`Wootang_Halt_<symbol>_<magic>`)
+  and stays halted — including across an EA reload — until a human deletes
+  that global variable or restarts the terminal. It will not silently
+  resume on its own.
+- **Losing-streak cooldown** (`Cooldown_On`, `MaxConsecutiveLosses`,
+  `CooldownMinutes`): pauses new entries for a cooldown period after N
+  losses in a row.
+- **ATR volatility regime filter** (`UseATRFilter`, `MinATRPoints`,
+  `MaxATRPoints`): skips entries when the market is too quiet (chop/whipsaw
+  risk) or too violent (news-spike risk).
+- **Session filter** (`UseSessionFilter`, `SessionStartHour`,
+  `SessionEndHour`): restricts entries to a configured server-time window.
+
+These are filters and sizing layered on top of the existing signal — the
+entry conditions themselves are still untouched from v7.

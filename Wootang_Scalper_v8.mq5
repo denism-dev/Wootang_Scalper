@@ -1,47 +1,49 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.1 — MT5                                       |
+//| Wootang Scalper v8.2 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
-//  Fixes applied on top of the v8 draft:
+//  v8.2 adds a professional-grade risk layer on top of the v8.1 bug
+//  fixes. None of this changes — or can change — the strategy's win
+//  rate; a Bollinger-band breakout scalper wins something like 35-55%
+//  of the time depending on the market, and that is normal. What
+//  actually separates a survivable EA from one that blows up an
+//  account is risk control around that edge, which is what this
+//  revision adds:
 //
-//  - CRITICAL: the "one trade at a time" lock (formerly HasAnyOrder())
-//    counted pending orders as blocking, which made the "clean stale
-//    pendings before every new entry" logic unreachable: whenever a
-//    pending order was already resting, the lock returned early and
-//    DeleteAllPending() never ran, permanently stalling the EA on any
-//    unfilled pending order. The lock now only checks OPEN POSITIONS
-//    (HasOpenPosition()). A resting pending order no longer blocks the
-//    EA — it is cleaned out the moment a fresh signal wants to place a
-//    new one, which is exactly what DeleteAllPending() already did;
-//    it just needed to be reachable.
-//  - Removed Sar_period, Step, Acceleration — leftover inputs from an
-//    earlier Parabolic-SAR version. The strategy runs entirely on
-//    Bollinger Bands and never referenced them.
-//  - Max_Spread is now enforced: entries are skipped while the spread
-//    exceeds it.
-//  - TrailingStop is now enforced on open positions via PositionModify.
-//  - Added minimum-stop-distance validation (SYMBOL_TRADE_STOPS_LEVEL)
-//    before sending pending orders and before trailing, and Print()
-//    logging on every failed trade/order/modify call so failures are
-//    no longer silent.
-//  - Daily profit is now accumulated incrementally in
-//    OnTradeTransaction instead of re-scanning the full day's deal
-//    history on every tick.
-//  - Trade entry conditions themselves are untouched.
+//  - Risk-based position sizing: lot size is derived from % equity
+//    risked per trade against the actual StopLoss distance, instead
+//    of a fixed lot or a margin-percentage guess disconnected from
+//    real risk.
+//  - Daily loss limit: mirrors the existing daily profit target, but
+//    halts trading for the day once realised losses reach it.
+//  - Account drawdown kill-switch: if equity falls MaxDrawdownPercent
+//    below its peak, ALL trading halts immediately and stays halted
+//    (via a persistent global variable) until a human clears it —
+//    this will not silently resume on its own.
+//  - Losing-streak cooldown: after MaxConsecutiveLosses losses in a
+//    row, new entries pause for CooldownMinutes.
+//  - ATR volatility regime filter: skips entries when the market is
+//    too quiet (chop/whipsaw risk) or too violent (news-spike risk).
+//  - Session filter: restricts entries to a configured server-time
+//    window, avoiding illiquid hours and rollover spread widening.
+//
+//  Trade entry conditions themselves remain unchanged from v7 — these
+//  are filters and sizing on top of the existing signal, not a new
+//  signal.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.1"
-#property description "Wootang Scalper MT5 — one trade at a time with TP/SL"
+#property version   "8.2"
+#property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\OrderInfo.mqh>
 
 //--- core inputs
-input int    Max_Spread    = 20;
+input int    Max_Spread    = 20;                                // Max spread (points) to allow entries
 input int    Magic         = 1111111;
 
 input string trisk         = "== Risk Management ==";          // ————————————————
@@ -49,21 +51,46 @@ input int    StopLoss      = 500;                               // Stop Loss (po
 input int    TakeProfit    = 500;                               // Take Profit (points)
 input int    TrailingStop  = 25;                                 // Trailing Stop (points, 0 = off)
 
-input string tdaily        = "== Daily Profit Target ==";      // ————————————————
-input bool   DailyTarget_On    = true;                         // Enable daily target
-input double DailyProfitTarget = 200;                           // Stop trading when daily profit reaches ($)
+input string tsizing       = "== Position Sizing ==";          // ————————————————
+input bool   UseRiskPercent = true;                             // Size by % equity risk (recommended)
+input double RiskPercent    = 1.0;                              // % equity risked per trade
+input bool   UsFixedLot     = false;                            // Fallback: use fixed lot size below
+input double uLotsValue     = 0.2;                              // Fixed lot size (only if UsFixedLot=true)
 
-input string tvolumen      = "== Volume Calculation ==";       // ————————————————
-input bool   UsFixedLot    = true;                             // Use fixed lot size
-input double uLotsValue    = 0.2;                             // Lot size / equity %
+input string tdaily        = "== Daily Circuit Breakers ==";   // ————————————————
+input bool   DailyTarget_On    = true;                          // Stop for the day at profit target
+input double DailyProfitTarget = 200;                            // Daily profit target ($)
+input bool   DailyLoss_On       = true;                         // Stop for the day at loss limit
+input double DailyLossLimit     = 100;                          // Daily loss limit ($, positive number)
+
+input string tdrawdown     = "== Account Drawdown Kill-Switch ==";  // ————————————————
+input bool   MaxDrawdown_On     = true;                        // Enable hard drawdown halt
+input double MaxDrawdownPercent = 10.0;                         // Halt ALL trading if equity falls this % below peak
+
+input string tstreak       = "== Losing-Streak Cooldown ==";   // ————————————————
+input bool   Cooldown_On          = true;                       // Enable cooldown after consecutive losses
+input int    MaxConsecutiveLosses = 3;                           // Losses in a row that trigger cooldown
+input int    CooldownMinutes      = 60;                          // Minutes to pause new entries after trigger
+
+input string tvol          = "== Volatility Regime Filter (ATR) ==";  // ————————————————
+input bool   UseATRFilter  = true;                              // Skip entries outside this ATR range
+input int    ATRPeriod     = 14;
+input double MinATRPoints  = 100;                                // Minimum ATR (points) required to trade, 0=off
+input double MaxATRPoints  = 800;                                // Maximum ATR (points) allowed, 0=off
+
+input string tsession      = "== Session Filter ==";           // ————————————————
+input bool   UseSessionFilter = true;                           // Restrict trading to a server-time window
+input int    SessionStartHour = 7;                               // Server time, 0-23
+input int    SessionEndHour   = 20;                              // Server time, 0-23 (exclusive)
 
 //--- trade objects
 CTrade        trade;
 CPositionInfo posInfo;
 COrderInfo    ordInfo;
 
-//--- indicator handle
+//--- indicator handles
 int g_BandsHandle = INVALID_HANDLE;
+int g_ATRHandle   = INVALID_HANDLE;
 
 //--- bar tracker — prevents multiple signals on the same bar
 int g_LastBars = 0;
@@ -71,6 +98,14 @@ int g_LastBars = 0;
 //--- daily profit tracking
 double g_DailyProfit = 0;
 int    g_LastDay     = -1;
+
+//--- drawdown kill-switch
+double g_EquityPeak  = 0;
+string g_HaltVarName  = "";
+
+//--- losing-streak cooldown
+int      g_ConsecutiveLosses = 0;
+datetime g_CooldownUntil     = 0;
 
 //+------------------------------------------------------------------+
 //| Price helpers                                                     |
@@ -150,7 +185,7 @@ void DeleteAllPending()
 
 //+------------------------------------------------------------------+
 //| Close all market positions and cancel all pending orders.        |
-//| Used by the daily profit target.                                 |
+//| Used by the daily circuit breakers and the drawdown kill-switch. |
 //+------------------------------------------------------------------+
 void CloseAll()
 {
@@ -177,9 +212,9 @@ void ApplyTrailingStop()
 {
     if(TrailingStop <= 0) return;
 
-    double trail   = MathMax(TrailingStop * _Point, GetMinStopDistance());
-    double ask     = GetAsk();
-    double bid     = GetBid();
+    double trail = MathMax(TrailingStop * _Point, GetMinStopDistance());
+    double ask   = GetAsk();
+    double bid   = GetBid();
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -270,21 +305,138 @@ void CheckDayRollover()
 }
 
 //+------------------------------------------------------------------+
-//| Lot size calculation                                              |
+//| Drawdown kill-switch. Uses a global variable (keyed by symbol +  |
+//| magic) so the halt SURVIVES an EA reload/reattach and only clears|
+//| when a human deletes it or the terminal restarts — this must not |
+//| silently resume on its own.                                      |
 //+------------------------------------------------------------------+
-double LotsCalculation()
+bool IsDrawdownHalted()
 {
-    if(UsFixedLot) return uLotsValue;
+    return GlobalVariableCheck(g_HaltVarName) && GlobalVariableGet(g_HaltVarName) >= 1.0;
+}
 
-    double freeMargin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
-    double marginFor1 = 0;
-    if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, 1.0, GetAsk(), marginFor1) || marginFor1 <= 0)
-        return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+void TriggerDrawdownHalt(double equity, double peak)
+{
+    GlobalVariableSet(g_HaltVarName, 1.0);
+    CloseAll();
+    Print("Wootang v8: *** DRAWDOWN KILL-SWITCH TRIGGERED *** equity=", equity,
+          " is more than ", MaxDrawdownPercent, "% below peak=", peak,
+          ". All trading halted. Delete global variable '", g_HaltVarName,
+          "' (or restart the terminal) after review to resume.");
+}
 
-    double mcPercent = (marginFor1 / freeMargin) * 100;
-    double lots      = NormalizeDouble(uLotsValue / mcPercent, 2);
-    double minLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot    = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+void UpdateDrawdownGuard()
+{
+    if(!MaxDrawdown_On) return;
+
+    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+    if(equity > g_EquityPeak) g_EquityPeak = equity;
+    if(g_EquityPeak <= 0)     return;
+
+    double ddPercent = (g_EquityPeak - equity) / g_EquityPeak * 100.0;
+    if(ddPercent >= MaxDrawdownPercent && !IsDrawdownHalted())
+        TriggerDrawdownHalt(equity, g_EquityPeak);
+}
+
+//+------------------------------------------------------------------+
+//| Losing-streak cooldown — updated from OnTradeTransaction as each |
+//| position for this EA closes.                                    |
+//+------------------------------------------------------------------+
+void RegisterClosedDealResult(double dealNetProfit)
+{
+    if(!Cooldown_On) return;
+
+    if(dealNetProfit < 0)
+    {
+        g_ConsecutiveLosses++;
+        if(g_ConsecutiveLosses >= MaxConsecutiveLosses)
+        {
+            g_CooldownUntil = TimeCurrent() + CooldownMinutes * 60;
+            Print("Wootang v8: ", g_ConsecutiveLosses, " consecutive losses — new entries paused until ",
+                  TimeToString(g_CooldownUntil, TIME_DATE | TIME_MINUTES));
+            g_ConsecutiveLosses = 0;
+        }
+    }
+    else if(dealNetProfit > 0)
+    {
+        g_ConsecutiveLosses = 0;
+    }
+}
+
+bool InCooldown()
+{
+    return Cooldown_On && TimeCurrent() < g_CooldownUntil;
+}
+
+//+------------------------------------------------------------------+
+//| Session filter — restrict entries to a server-time window.       |
+//| Supports windows that wrap past midnight.                        |
+//+------------------------------------------------------------------+
+bool WithinSession()
+{
+    if(!UseSessionFilter) return true;
+    if(SessionStartHour == SessionEndHour) return true; // 24h window
+
+    MqlDateTime tm;
+    TimeToStruct(TimeCurrent(), tm);
+
+    if(SessionStartHour < SessionEndHour)
+        return tm.hour >= SessionStartHour && tm.hour < SessionEndHour;
+
+    return tm.hour >= SessionStartHour || tm.hour < SessionEndHour;
+}
+
+//+------------------------------------------------------------------+
+//| ATR volatility regime filter. Fails CLOSED (skips the trade) if  |
+//| the indicator buffer can't be read — better to sit out than to   |
+//| trade blind on a data hiccup.                                    |
+//+------------------------------------------------------------------+
+bool VolatilityOk()
+{
+    if(!UseATRFilter) return true;
+
+    double atrBuf[];
+    ArraySetAsSeries(atrBuf, true);
+    if(CopyBuffer(g_ATRHandle, 0, 0, 1, atrBuf) != 1) return false;
+
+    double atrPoints = atrBuf[0] / _Point;
+    if(MinATRPoints > 0 && atrPoints < MinATRPoints) return false;
+    if(MaxATRPoints > 0 && atrPoints > MaxATRPoints) return false;
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Risk-based lot size: sized so a full StopLoss hit loses           |
+//| RiskPercent% of current equity. Falls back to a fixed lot when    |
+//| UseRiskPercent is off.                                             |
+//+------------------------------------------------------------------+
+double CalcRiskLots(double slPoints)
+{
+    if(slPoints <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+    double riskMoney = equity * (RiskPercent / 100.0);
+
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    if(tickValue <= 0 || tickSize <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    double valuePerPoint = tickValue * (_Point / tickSize);
+    double lossPerLot    = slPoints * valuePerPoint;
+    if(lossPerLot <= 0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+    return riskMoney / lossPerLot;
+}
+
+double LotsCalculation(double slPoints)
+{
+    double lots = UseRiskPercent ? CalcRiskLots(slPoints) : uLotsValue;
+
+    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    if(lotStep > 0)
+        lots = MathFloor(lots / lotStep) * lotStep;
     if(lots < minLot) lots = minLot;
     if(lots > maxLot) lots = maxLot;
     return lots;
@@ -306,12 +458,28 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    g_LastBars    = 0;
-    g_DailyProfit = 0;
-    g_LastDay     = -1;
+    g_ATRHandle = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+    if(g_ATRHandle == INVALID_HANDLE)
+    {
+        Print("Wootang v8: ATR handle creation failed");
+        return INIT_FAILED;
+    }
 
-    Print("Wootang Scalper v8 started. TP=", TakeProfit, "pts  SL=", StopLoss,
-          "pts  Trail=", TrailingStop, "pts");
+    g_LastBars          = 0;
+    g_DailyProfit        = 0;
+    g_LastDay            = -1;
+    g_ConsecutiveLosses  = 0;
+    g_CooldownUntil      = 0;
+    g_EquityPeak         = AccountInfoDouble(ACCOUNT_EQUITY);
+    g_HaltVarName        = StringFormat("Wootang_Halt_%s_%d", _Symbol, Magic);
+
+    if(IsDrawdownHalted())
+        Print("Wootang v8: loaded with an ACTIVE drawdown halt ('", g_HaltVarName,
+              "'). No new trades will be placed until it is cleared.");
+
+    Print("Wootang Scalper v8.2 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+          "pts  Trail=", TrailingStop, "pts  Risk=",
+          UseRiskPercent ? DoubleToString(RiskPercent, 2) + "%" : "fixed lot " + DoubleToString(uLotsValue, 2));
     return INIT_SUCCEEDED;
 }
 
@@ -320,13 +488,14 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-    if(g_BandsHandle != INVALID_HANDLE)
-        IndicatorRelease(g_BandsHandle);
+    if(g_BandsHandle != INVALID_HANDLE) IndicatorRelease(g_BandsHandle);
+    if(g_ATRHandle   != INVALID_HANDLE) IndicatorRelease(g_ATRHandle);
 }
 
 //+------------------------------------------------------------------+
-//| OnTradeTransaction — accumulate realised daily profit as deals   |
-//| close, instead of re-scanning the whole day's history every tick.|
+//| OnTradeTransaction — accumulate realised daily profit and track  |
+//| the losing-streak cooldown as deals close, instead of             |
+//| re-scanning the whole day's history every tick.                  |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest      &request,
@@ -340,9 +509,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
     if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY)  != DEAL_ENTRY_OUT) return;
 
     CheckDayRollover();
-    g_DailyProfit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
-                    + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
-                    + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+    double dealNetProfit = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+                          + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+                          + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+    g_DailyProfit += dealNetProfit;
+
+    RegisterClosedDealResult(dealNetProfit);
 }
 
 //+------------------------------------------------------------------+
@@ -350,12 +522,21 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    //--- daily profit target check
-    if(DailyTarget_On)
+    //--- drawdown kill-switch — checked first, overrides everything else
+    UpdateDrawdownGuard();
+    if(IsDrawdownHalted()) return;
+
+    //--- daily circuit breakers
+    if(DailyTarget_On || DailyLoss_On)
     {
         CheckDayRollover();
 
-        if(g_DailyProfit >= DailyProfitTarget)
+        if(DailyTarget_On && g_DailyProfit >= DailyProfitTarget)
+        {
+            CloseAll();
+            return; // halt for the rest of the day
+        }
+        if(DailyLoss_On && g_DailyProfit <= -MathAbs(DailyLossLimit))
         {
             CloseAll();
             return; // halt for the rest of the day
@@ -370,8 +551,17 @@ void OnTick()
     //--- it gets replaced below the moment a fresh signal fires.
     if(HasOpenPosition()) return;
 
+    //--- losing-streak cooldown
+    if(InCooldown()) return;
+
+    //--- session filter
+    if(!WithinSession()) return;
+
     //--- spread filter — skip entries while the market is too wide
     if(GetSpreadPoints() > Max_Spread) return;
+
+    //--- volatility regime filter
+    if(!VolatilityOk()) return;
 
     double Ask         = GetAsk();
     double Bid         = GetBid();
@@ -400,7 +590,7 @@ void OnTick()
             return;
         }
 
-        double lots  = LotsCalculation();
+        double lots = LotsCalculation(StopLoss);
         if(!trade.BuyStop(lots, price, _Symbol, sl, tp,
                            ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
             Print("Wootang v8: BuyStop failed err=", GetLastError());
@@ -435,7 +625,7 @@ void OnTick()
             return;
         }
 
-        double lots  = LotsCalculation();
+        double lots = LotsCalculation(StopLoss);
         if(!trade.SellStop(lots, price, _Symbol, sl, tp,
                             ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
             Print("Wootang v8: SellStop failed err=", GetLastError());
