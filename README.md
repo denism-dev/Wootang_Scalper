@@ -312,3 +312,64 @@ rather than fixing a defect, so I'm not deciding them for you:
   portfolio-level open-risk cap needs the same kind of shared-state
   coordination as the drawdown halt — worth building only if you actually
   run multiple instances at once.
+
+## v8.8 — fixes to the v8.7 fixes themselves, found before ever compiling
+
+A further pre-compile review found real gaps in v8.7's own fixes:
+
+- **Fixed a daily-P/L double-count.** `CheckDayRollover()`'s reseed scans
+  all of today's history, which already includes the very deal that
+  triggered `OnTradeTransaction` — it's already in history by the time the
+  event fires. So on the first close of each day, that deal's amount was
+  added once by the reseed and once by the incremental add, on top of each
+  other. Daily P/L is now accumulated per **deal** (entry and exit both, on
+  the calendar day each occurs) — separately from the per-**position**
+  result used for the losing-streak counter — and the incremental add is
+  skipped on the specific call where a reseed just happened. This also
+  fixes a related discrepancy for a position spanning midnight: the daily
+  total now correctly reflects only that day's cash flows, while the
+  streak counter still sees the complete round-trip result.
+- **Fixed a real correctness bug in the "is this position still open"
+  check.** `DEAL_POSITION_ID` maps to `POSITION_IDENTIFIER`, not
+  `POSITION_TICKET` — MetaQuotes documents them as distinct, and they can
+  diverge on exactly the case this check exists for: a partial close,
+  where the ticket can change but the identifier doesn't.
+  `PositionSelectByTicket(positionId)` could therefore miss a position
+  that's still open under a new ticket, prematurely finalizing a trade
+  that wasn't actually done. Replaced with
+  `IsPositionIdentifierStillOpen()`, which scans open positions by their
+  actual `POSITION_IDENTIFIER`.
+- **`DeleteAllPending()` now returns false if any deletion isn't
+  server-confirmed**, and both entry paths abort the new order rather than
+  risk placing it alongside a pending order that might still be resting —
+  directly protecting the one-order-at-a-time design this EA is built
+  around.
+- **`ConfirmTradeResult()` no longer accepts `TRADE_RETCODE_DONE_PARTIAL`
+  as success.** A partially-completed `PositionClose` inside a safety halt
+  is not "flat," and nowhere in this EA is a partial fill actually
+  intended, so there's no call site that benefits from treating one as
+  confirmed.
+- **Indicator/price validation now also checks `MathIsValidNumber()`.** A
+  NaN value fails every ordinary comparison, including `<= 0`, so it could
+  have slipped past the `EMPTY_VALUE`/zero checks added in v8.6/v8.7 and
+  reopened the exact fail-open SELL-gate risk those fixes were meant to
+  close. Also added an explicit `lowerBand < upperBand` sanity check.
+- **Cooldown/streak global variable names are now also scoped by
+  `ACCOUNT_LOGIN`** — an oversight when they were added in v8.7 (the
+  halt/peak variables already were scoped this way).
+- **Added a dedicated, race-free reset mechanism.** The v8.7
+  rebase-on-clear logic only works if a running EA instance observes the
+  halted→cleared transition live. Clearing the halt while no instance was
+  running (an offline reset) would leave the stale peak in place and could
+  retrigger the halt the moment trading resumed. Setting a dedicated
+  `Wootang_RequestReset_<login>` global variable to `1` is now checked in
+  both `OnInit` and every `OnTick`, so it's processed correctly regardless
+  of instance timing. The old bare-deletion method still works whenever an
+  instance is running to observe it.
+- **Risk-based sizing now uses the actual order side.** `LotsCalculation`
+  takes the real `ORDER_TYPE_BUY`/`ORDER_TYPE_SELL` and that order's own
+  normalized entry/SL prices, instead of always modelling a BUY moving
+  against a live Ask regardless of which side is actually being sized.
+
+Still not compiled or backtested. The next real step is MetaEditor and the
+Strategy Tester, not another review pass.

@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.7 — MT5                                       |
+//| Wootang Scalper v8.8 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
@@ -149,11 +149,59 @@
 //    on an invalid combination) and seeded g_LastClosedEvalBars to the
 //    current bar count instead of 0, so attaching mid-candle in
 //    closed-bar mode doesn't evaluate a partially-elapsed bar.
+//
+//  v8.8 fixes a review of v8.7 that found real gaps in the fixes
+//  themselves — all pre-compile, none of this has run yet:
+//  - Fixed a daily-P/L double-count: CheckDayRollover()'s reseed scans
+//    ALL of today's history, which already includes the very deal that
+//    triggered OnTradeTransaction (it's already in history by the time
+//    the event fires) — so on the first close of each day, its amount
+//    was added twice. Daily P/L is now accumulated per DEAL (both entry
+//    and exit, on the calendar day each occurs), separately from the
+//    per-POSITION result used for the losing-streak counter, and the
+//    incremental add is skipped specifically on a call where a reseed
+//    just happened.
+//  - Fixed a real correctness bug in the position-still-open check:
+//    DEAL_POSITION_ID maps to POSITION_IDENTIFIER, not POSITION_TICKET
+//    — the two usually match but are documented as distinct, and a
+//    partial close is exactly the case where they can diverge (ticket
+//    can change; identifier doesn't). PositionSelectByTicket(positionId)
+//    could therefore miss a position that's still open under a new
+//    ticket. Replaced with IsPositionIdentifierStillOpen(), which scans
+//    open positions by their actual POSITION_IDENTIFIER.
+//  - DeleteAllPending() now returns false if any deletion isn't
+//    server-confirmed, and both entry paths abort rather than placing a
+//    new order on top of a pending order that might still be resting —
+//    important given this EA's one-order-at-a-time design.
+//  - ConfirmTradeResult() no longer treats TRADE_RETCODE_DONE_PARTIAL as
+//    success. A partially-completed PositionClose inside a safety halt
+//    is not "flat" and must not be logged as confirmed.
+//  - Indicator/price validation now uses MathIsValidNumber() in addition
+//    to the EMPTY_VALUE/zero checks already in place — a NaN value fails
+//    every ordinary comparison (including `<= 0`), so it could have
+//    slipped through the v8.6/v8.7 guards and reopened the same fail-open
+//    SELL-gate risk those fixes closed. Also added an explicit
+//    lowerBand < upperBand sanity check.
+//  - Cooldown/streak global variable names are now also scoped by
+//    ACCOUNT_LOGIN (an oversight when they were added in v8.7 — the
+//    halt/peak variables already were).
+//  - Added an explicit, race-free reset mechanism (a dedicated
+//    "request reset" global variable, checked in OnInit and every
+//    OnTick) for clearing the drawdown halt. The v8.7 rebase-on-clear
+//    logic only works if a running instance observes the halted→cleared
+//    transition; an offline reset (halt cleared while no instance was
+//    running) would leave the stale peak in place and could retrigger
+//    the halt immediately. The old bare-deletion method still works
+//    when an instance is running to observe it.
+//  - Risk-based lot sizing now uses the actual order side and its own
+//    normalized entry/SL prices (ORDER_TYPE_BUY for BuyStop,
+//    ORDER_TYPE_SELL for SellStop) instead of always modelling a BUY
+//    moving against a live Ask.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.7"
+#property version   "8.8"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
@@ -234,9 +282,10 @@ int    g_LastDay     = -1;
 double g_EquityPeak   = 0;
 string g_HaltVarName  = "";
 string g_PeakVarName  = "";
+string g_ResetVarName = ""; // explicit, race-free "clear halt + rebase peak" request
 bool   g_WasHalted    = false; // this instance's own last-seen halt state, to detect a manual clear
 
-//--- losing-streak cooldown (persisted per symbol+magic — see OnInit)
+//--- losing-streak cooldown (persisted per account+symbol+magic — see OnInit)
 int      g_ConsecutiveLosses    = 0;
 datetime g_CooldownUntil        = 0;
 string   g_CooldownCountVarName = "";
@@ -281,18 +330,30 @@ double NormalizeToTick(double price)
 }
 
 //+------------------------------------------------------------------+
+//| A value is usable as a price/indicator reading only if it's a    |
+//| real finite number (not NaN/inf — MathIsValidNumber), not the     |
+//| "not calculated yet" EMPTY_VALUE sentinel, and strictly positive. |
+//| NaN fails EVERY ordinary comparison including `<= 0`, so relying  |
+//| on range checks alone can silently let a NaN through.            |
+//+------------------------------------------------------------------+
+bool ValidIndicatorValue(double v)
+{
+    return MathIsValidNumber(v) && v != EMPTY_VALUE && v > 0;
+}
+
+//+------------------------------------------------------------------+
 //| Read one Bollinger Band buffer value                              |
 //| buffer 1 = upper band,  buffer 2 = lower band                    |
 //| shift 0 = current (forming) bar, shift 1 = last closed bar       |
-//| Returns 0 on a failed read OR an EMPTY_VALUE (indicator hasn't    |
-//| calculated that bar yet) — callers treat both as "unavailable".  |
+//| Returns 0 on a failed read, an EMPTY_VALUE, or a NaN — callers    |
+//| treat all three as "unavailable".                                 |
 //+------------------------------------------------------------------+
 double GetBand(int buffer, int shift = 0)
 {
     double buf[];
     ArraySetAsSeries(buf, true);
     if(CopyBuffer(g_BandsHandle, buffer, shift, 1, buf) != 1) return 0;
-    if(buf[0] == EMPTY_VALUE) return 0;
+    if(!MathIsValidNumber(buf[0]) || buf[0] == EMPTY_VALUE) return 0;
     return buf[0];
 }
 
@@ -316,12 +377,39 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
+//| Search OPEN positions by POSITION_IDENTIFIER (what DEAL_POSITION_ |
+//| ID actually maps to), not by ticket. POSITION_TICKET and          |
+//| POSITION_IDENTIFIER are documented as distinct properties that    |
+//| usually match but aren't guaranteed to — a partial close is       |
+//| exactly the case where the ticket can change while the identifier |
+//| stays the same. Using PositionSelectByTicket(positionId) directly |
+//| could therefore miss a position that's still open under a new    |
+//| ticket, which is precisely the scenario this check exists for.   |
+//+------------------------------------------------------------------+
+bool IsPositionIdentifierStillOpen(ulong positionId)
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        if(!PositionSelectByTicket(ticket)) continue;
+
+        ulong identifier = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+        if(identifier == positionId) return true;
+    }
+    return false;
+}
+
+//+------------------------------------------------------------------+
 //| A `true`/local-success return from a CTrade call only means the  |
 //| request passed local/client-side validation — it does NOT mean   |
 //| the broker actually accepted and executed it. Always check       |
 //| ResultRetcode() too, so a rejection (bad filling mode, invalid    |
 //| stops, insufficient margin, market restrictions) shows up as a   |
 //| clear log line instead of being silently assumed successful.     |
+//| TRADE_RETCODE_DONE_PARTIAL is NOT treated as success: a partial   |
+//| close inside a safety halt is not "flat", and this EA never       |
+//| intends a partial fill anywhere else either.                     |
 //| Pass requireOrderTicket=true only for a pending-order PLACEMENT   |
 //| (BuyStop/SellStop), where ResultOrder()!=0 is meaningful.          |
 //+------------------------------------------------------------------+
@@ -329,25 +417,32 @@ bool ConfirmTradeResult(const string label, bool localOk, bool requireOrderTicke
 {
     uint  retcode = trade.ResultRetcode();
     ulong order   = trade.ResultOrder();
-    bool  ok      = localOk && (retcode == TRADE_RETCODE_DONE
-                              || retcode == TRADE_RETCODE_PLACED
-                              || retcode == TRADE_RETCODE_DONE_PARTIAL);
+    bool  ok      = localOk && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED);
     if(ok && requireOrderTicket && order == 0) ok = false;
 
     if(!ok)
+    {
+        string extra = (retcode == TRADE_RETCODE_DONE_PARTIAL)
+                        ? " — PARTIAL fill/close; NOT treated as fully confirmed"
+                        : "";
         Print("Wootang v8: ", label, " NOT confirmed. localOk=", localOk,
               " order=", order, " retcode=", retcode,
-              " (", trade.ResultRetcodeDescription(), ")");
+              " (", trade.ResultRetcodeDescription(), ")", extra);
+    }
     return ok;
 }
 
 //+------------------------------------------------------------------+
 //| Cancel ALL pending orders for this EA (buy and sell stops).      |
 //| Called unconditionally before every new entry attempt so no      |
-//| stale orders from previous bars can accumulate.                  |
+//| stale orders from previous bars can accumulate. Returns false if |
+//| ANY deletion isn't server-confirmed — callers must abort the new |
+//| entry rather than risk placing it alongside an old, still-resting|
+//| opposing order, which would break the one-order-at-a-time design.|
 //+------------------------------------------------------------------+
-void DeleteAllPending()
+bool DeleteAllPending()
 {
+    bool allOk = true;
     for(int i = OrdersTotal() - 1; i >= 0; i--)
     {
         if(ordInfo.SelectByIndex(i)
@@ -355,9 +450,11 @@ void DeleteAllPending()
            && ordInfo.Magic()  == Magic)
         {
             bool ok = trade.OrderDelete(ordInfo.Ticket());
-            ConfirmTradeResult("OrderDelete #" + IntegerToString((long)ordInfo.Ticket()), ok);
+            if(!ConfirmTradeResult("OrderDelete #" + IntegerToString((long)ordInfo.Ticket()), ok))
+                allOk = false;
         }
     }
+    return allOk;
 }
 
 //+------------------------------------------------------------------+
@@ -475,10 +572,9 @@ bool PendingDistancesOk(double orderPrice, double sl, double tp, double currentP
 //+------------------------------------------------------------------+
 //| Today's realised profit from deal history — used only to seed/  |
 //| reseed g_DailyProfit on EA start and day rollover. Per-tick       |
-//| tracking is incremental via OnTradeTransaction. Sums EVERY deal  |
-//| (entry and exit) for this symbol+magic today, excluding balance/ |
-//| credit operations, so it matches the per-position accounting     |
-//| OnTradeTransaction now uses.                                     |
+//| tracking is incremental via OnTradeTransaction, per DEAL (see     |
+//| there for why). Sums EVERY deal (entry and exit) for this         |
+//| symbol+magic today, excluding balance/credit operations.          |
 //+------------------------------------------------------------------+
 double GetDailyProfitFromHistory()
 {
@@ -507,8 +603,13 @@ double GetDailyProfitFromHistory()
 
 //+------------------------------------------------------------------+
 //| Reset/reseed g_DailyProfit whenever the calendar day changes.    |
+//| Returns true if a reseed just happened THIS call — callers that  |
+//| are about to incrementally add a deal's own amount must skip that|
+//| add when this returns true, because the reseed already scanned   |
+//| full history and that deal is already in it by the time it's     |
+//| being processed (otherwise it gets counted twice).               |
 //+------------------------------------------------------------------+
-void CheckDayRollover()
+bool CheckDayRollover()
 {
     MqlDateTime tm;
     TimeToStruct(TimeCurrent(), tm);
@@ -516,7 +617,9 @@ void CheckDayRollover()
     {
         g_LastDay     = tm.day;
         g_DailyProfit = GetDailyProfitFromHistory();
+        return true;
     }
+    return false;
 }
 
 //+------------------------------------------------------------------+
@@ -527,14 +630,37 @@ void CheckDayRollover()
 //| halt is genuinely account-wide.                                   |
 //|                                                                    |
 //| The halt does NOT clear on an EA reload or terminal restart — MT5|
-//| global variables persist across both. Only deleting the global   |
-//| variable (Terminal -> Global Variables) clears it — and clearing  |
-//| it automatically rebases the peak to current equity (see OnTick), |
-//| so resuming doesn't require separately resetting the peak too.   |
+//| global variables persist across both. Two ways to clear it:       |
+//|  (a) set g_ResetVarName to 1 (Terminal -> Global Variables) — this|
+//|      is race-free: ProcessResetRequestIfAny() is checked in       |
+//|      OnInit AND every OnTick, so it works even if no EA instance  |
+//|      was running at the moment you set it.                        |
+//|  (b) delete g_HaltVarName directly — simpler, but only rebases    |
+//|      the peak if a running instance is polling and observes the   |
+//|      halted->cleared transition (see OnTick).                     |
 //+------------------------------------------------------------------+
 bool IsDrawdownHalted()
 {
     return GlobalVariableCheck(g_HaltVarName) && GlobalVariableGet(g_HaltVarName) >= 1.0;
+}
+
+//+------------------------------------------------------------------+
+//| Race-free halt clear + peak rebase: checked in OnInit and at the  |
+//| top of every OnTick, so a reset requested while no EA instance    |
+//| was running still gets processed the moment one starts polling.   |
+//+------------------------------------------------------------------+
+void ProcessResetRequestIfAny()
+{
+    if(!GlobalVariableCheck(g_ResetVarName) || GlobalVariableGet(g_ResetVarName) < 1.0)
+        return;
+
+    GlobalVariableDel(g_ResetVarName);
+    GlobalVariableDel(g_HaltVarName);
+    g_EquityPeak = AccountInfoDouble(ACCOUNT_EQUITY);
+    GlobalVariableSet(g_PeakVarName, g_EquityPeak);
+    g_WasHalted = false;
+    Print("Wootang v8: reset request processed — drawdown halt cleared and equity peak rebased to ",
+          g_EquityPeak, ". Set '", g_ResetVarName, "' to 1 again to repeat.");
 }
 
 void TriggerDrawdownHalt(double equity, double peak)
@@ -544,9 +670,11 @@ void TriggerDrawdownHalt(double equity, double peak)
     Print("Wootang v8: *** ACCOUNT DRAWDOWN KILL-SWITCH TRIGGERED *** equity=", equity,
           " is more than ", MaxDrawdownPercent, "% below peak=", peak,
           ". Every position/order for this Magic number across every symbol has been closed. ",
-          "This does NOT clear on an EA reload or terminal restart. After review, delete the ",
-          "global variable '", g_HaltVarName, "' (Terminal -> Global Variables) to resume — ",
-          "the equity peak rebases to current equity automatically the moment the halt clears.");
+          "This does NOT clear on an EA reload or terminal restart. To resume after review, set the ",
+          "global variable '", g_ResetVarName, "' to 1 (Terminal -> Global Variables) — this atomically ",
+          "clears the halt and rebases the equity peak to current equity, and works even if no EA ",
+          "instance is running at the moment you do it. Deleting '", g_HaltVarName, "' directly also ",
+          "still works, but only rebases the peak if a running instance observes the change.");
 }
 
 void UpdateDrawdownGuard()
@@ -573,14 +701,16 @@ void UpdateDrawdownGuard()
 
 //+------------------------------------------------------------------+
 //| Losing-streak cooldown — updated from OnTradeTransaction once a  |
-//| position for this EA fully closes. Persisted (per symbol+magic)  |
-//| so a restart mid-cooldown doesn't silently resume trading.       |
+//| position for this EA fully closes, using that position's COMPLETE |
+//| round-trip result (all deals, not just today's). Persisted (per   |
+//| account+symbol+magic) so a restart mid-cooldown doesn't silently  |
+//| resume trading.                                                    |
 //+------------------------------------------------------------------+
-void RegisterClosedDealResult(double dealNetProfit)
+void RegisterClosedDealResult(double positionNet)
 {
     if(!Cooldown_On) return;
 
-    if(dealNetProfit < 0)
+    if(positionNet < 0)
     {
         g_ConsecutiveLosses++;
         GlobalVariableSet(g_CooldownCountVarName, g_ConsecutiveLosses);
@@ -595,7 +725,7 @@ void RegisterClosedDealResult(double dealNetProfit)
             GlobalVariableSet(g_CooldownCountVarName, 0);
         }
     }
-    else if(dealNetProfit > 0)
+    else if(positionNet > 0)
     {
         g_ConsecutiveLosses = 0;
         GlobalVariableSet(g_CooldownCountVarName, 0);
@@ -628,7 +758,7 @@ bool WithinSession()
 //+------------------------------------------------------------------+
 //| ATR volatility regime filter. Fails CLOSED (skips the trade) if  |
 //| the indicator buffer can't be read, or hasn't been calculated    |
-//| yet (EMPTY_VALUE) — better to sit out than to trade blind.       |
+//| yet (EMPTY_VALUE) or is NaN — better to sit out than trade blind.|
 //+------------------------------------------------------------------+
 bool VolatilityOk()
 {
@@ -637,7 +767,7 @@ bool VolatilityOk()
     double atrBuf[];
     ArraySetAsSeries(atrBuf, true);
     if(CopyBuffer(g_ATRHandle, 0, 0, 1, atrBuf) != 1) return false;
-    if(atrBuf[0] == EMPTY_VALUE || atrBuf[0] <= 0) return false;
+    if(!ValidIndicatorValue(atrBuf[0])) return false;
 
     double atrPoints = atrBuf[0] / _Point;
     if(MinATRPoints > 0 && atrPoints < MinATRPoints) return false;
@@ -687,28 +817,24 @@ void MaintainPendingOrders()
 }
 
 //+------------------------------------------------------------------+
-//| Risk-based lot size: sized so a full StopLoss hit loses           |
+//| Risk-based lot size: sized so entryPrice moving to stopPrice loses|
 //| RiskPercent% of current equity. Uses OrderCalcProfit() (the       |
 //| broker/terminal's own pricing) rather than manual tick-value      |
 //| math, which can be inaccurate on instruments where contract specs |
-//| make that math non-linear (some CFDs/futures/cross-currency      |
-//| pairs). Modelled as a BUY moving slPoints against it; on          |
-//| virtually all FX/CFD instruments the loss magnitude for an        |
-//| equivalent adverse SELL move is the same.                        |
+//| make that math non-linear. `side` must match the real order      |
+//| direction (ORDER_TYPE_BUY for a BuyStop, ORDER_TYPE_SELL for a    |
+//| SellStop) so the loss is priced for the actual trade, not always  |
+//| modelled as a BUY.                                                |
 //+------------------------------------------------------------------+
-double CalcRiskLots(double slPoints)
+double CalcRiskLots(ENUM_ORDER_TYPE side, double entryPrice, double stopPrice)
 {
-    if(slPoints <= 0) return 0;
+    if(entryPrice <= 0 || stopPrice <= 0) return 0;
 
     double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
     double riskMoney = equity * (RiskPercent / 100.0);
 
-    double price      = GetAsk();
-    double closePrice = price - slPoints * _Point;
-    if(price <= 0 || closePrice <= 0) return 0;
-
     double profitFor1Lot = 0;
-    if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, price, closePrice, profitFor1Lot))
+    if(!OrderCalcProfit(side, _Symbol, 1.0, entryPrice, stopPrice, profitFor1Lot))
         return 0; // broker/terminal couldn't price it — skip rather than guess
 
     double lossPerLot = MathAbs(profitFor1Lot);
@@ -725,7 +851,7 @@ double CalcRiskLots(double slPoints)
 //| In SIZING_FIXED_LOT mode the user's chosen size is clamped to the |
 //| broker's limits as normal.                                        |
 //+------------------------------------------------------------------+
-double LotsCalculation(double slPoints)
+double LotsCalculation(ENUM_ORDER_TYPE side, double entryPrice, double stopPrice)
 {
     double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
     double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -733,7 +859,7 @@ double LotsCalculation(double slPoints)
 
     if(SizingMode == SIZING_RISK_PERCENT)
     {
-        double lots = CalcRiskLots(slPoints);
+        double lots = CalcRiskLots(side, entryPrice, stopPrice);
         if(lots <= 0) return 0;
         if(lotStep > 0) lots = MathFloor(lots / lotStep) * lotStep;
 
@@ -824,27 +950,30 @@ int OnInit()
 
     // Global variables are shared by every program in this terminal instance
     // regardless of which account is logged in, so scope them to the current
-    // account login to avoid a halt/peak from one account leaking into another.
+    // account login to avoid state from one account leaking into another.
     long login = AccountInfoInteger(ACCOUNT_LOGIN);
-    g_HaltVarName = "Wootang_AccountHalt_" + IntegerToString(login);
-    g_PeakVarName = "Wootang_AccountEquityPeak_" + IntegerToString(login);
+    g_HaltVarName  = "Wootang_AccountHalt_" + IntegerToString(login);
+    g_PeakVarName  = "Wootang_AccountEquityPeak_" + IntegerToString(login);
+    g_ResetVarName = "Wootang_RequestReset_" + IntegerToString(login);
+
+    ProcessResetRequestIfAny(); // handles a reset requested while no instance was running
 
     double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
     g_EquityPeak = MathMax(storedPeak, AccountInfoDouble(ACCOUNT_EQUITY));
     GlobalVariableSet(g_PeakVarName, g_EquityPeak);
     g_WasHalted = IsDrawdownHalted();
 
-    // Cooldown/streak state is per symbol+magic (unlike the account-wide
-    // drawdown halt) and persisted so a restart mid-cooldown doesn't
-    // silently resume trading.
-    g_CooldownCountVarName = "Wootang_ConsecLosses_" + _Symbol + "_" + IntegerToString(Magic);
-    g_CooldownUntilVarName = "Wootang_CooldownUntil_" + _Symbol + "_" + IntegerToString(Magic);
+    // Cooldown/streak state is per account+symbol+magic (unlike the
+    // account-wide drawdown halt) and persisted so a restart mid-cooldown
+    // doesn't silently resume trading.
+    g_CooldownCountVarName = "Wootang_ConsecLosses_" + IntegerToString(login) + "_" + _Symbol + "_" + IntegerToString(Magic);
+    g_CooldownUntilVarName = "Wootang_CooldownUntil_" + IntegerToString(login) + "_" + _Symbol + "_" + IntegerToString(Magic);
     g_ConsecutiveLosses = GlobalVariableCheck(g_CooldownCountVarName) ? (int)GlobalVariableGet(g_CooldownCountVarName) : 0;
     g_CooldownUntil     = GlobalVariableCheck(g_CooldownUntilVarName) ? (datetime)GlobalVariableGet(g_CooldownUntilVarName) : 0;
 
     if(IsDrawdownHalted())
         Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
-              "'). No new trades will be placed until it is cleared.");
+              "'). No new trades will be placed until it is cleared (set '", g_ResetVarName, "' to 1).");
 
     if(InCooldown())
         Print("Wootang v8: loaded mid-cooldown (restored from a previous session) — new entries paused until ",
@@ -855,7 +984,7 @@ int OnInit()
           "your intended risk on this symbol (a 5-digit FX symbol's 500 points is 50 pips; a 3-digit ",
           "JPY-style symbol's 500 points is 50 pips too, but check unusual symbols individually).");
 
-    Print("Wootang Scalper v8.7 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+    Print("Wootang Scalper v8.8 started. TP=", TakeProfit, "pts  SL=", StopLoss,
           "pts  Trail=", TrailingStop, "pts  Sizing=",
           SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
                                              : "fixed lot " + DoubleToString(uLotsValue, 2),
@@ -873,10 +1002,19 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| OnTradeTransaction — accumulate realised daily profit and track  |
-//| the losing-streak cooldown once a position for this EA fully     |
-//| closes, instead of re-scanning the whole day's history every     |
-//| tick.                                                             |
+//| OnTradeTransaction — two SEPARATE accounting concerns:            |
+//|  - Daily P/L: accumulated per DEAL (entry and exit both), on the  |
+//|    calendar day each deal occurs. This must match what            |
+//|    GetDailyProfitFromHistory() would compute for that day, so the |
+//|    daily breaker's incremental tracking and its reseed always     |
+//|    agree — including for a position that spans midnight.          |
+//|  - Losing-streak cooldown: the COMPLETE round-trip result of a    |
+//|    fully-closed position (all its deals, whatever day they fell   |
+//|    on), which is what "win" or "loss" means for streak purposes.  |
+//| These must stay separate: summing a position's full result INTO  |
+//| the daily total would double-count today's portion of it (it's   |
+//| already being added deal-by-deal) and wrongly pull in any part of |
+//| the trade that happened on an earlier day.                        |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                          const MqlTradeRequest      &request,
@@ -905,20 +1043,33 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
         return;
     }
 
-    if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)        return;
-    if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC)  != (long)Magic)    return;
-    if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY)  != DEAL_ENTRY_OUT) return;
+    if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != _Symbol)     return;
+    if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC)  != (long)Magic) return;
 
-    // Only finalize once the position is fully flat — a partial close
-    // still leaves it open, and its final result isn't known yet.
+    // Daily P/L: account THIS deal on the calendar day it occurs. If
+    // CheckDayRollover() just reseeded from history, this exact deal is
+    // already included in that reseed (it's already in history by the
+    // time this event fires) — skip the incremental add for THIS call
+    // only, or it gets counted twice.
+    bool reseeded = CheckDayRollover();
+    double thisDealNet = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
+                        + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
+                        + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
+                        + HistoryDealGetDouble(dealTicket, DEAL_FEE);
+    if(!reseeded)
+        g_DailyProfit += thisDealNet;
+
+    // Losing-streak/cooldown: only entry deals fall through past here to
+    // return; only once the WHOLE position is confirmed flat do we
+    // finalize a result.
+    if(HistoryDealGetInteger(dealTicket, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
+
     long positionId = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-    if(PositionSelectByTicket((ulong)positionId)) return;
+    if(IsPositionIdentifierStillOpen((ulong)positionId)) return; // partial close — wait
 
-    CheckDayRollover();
-
-    // Sum every deal tied to this position (entry + all exits): this is
-    // the only way to capture entry-side commission/fees and to treat a
-    // partially-filled close as one trade result, not several.
+    // Sum every deal tied to this position (entry + all exits, whatever
+    // calendar day each fell on) for the complete round-trip result —
+    // this is what "win" or "loss" means for the streak counter.
     double positionNet = 0;
     if(HistorySelectByPosition(positionId))
     {
@@ -935,14 +1086,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
     }
     else
     {
-        // Fallback: at least count this one deal's own numbers.
-        positionNet = HistoryDealGetDouble(dealTicket, DEAL_PROFIT)
-                    + HistoryDealGetDouble(dealTicket, DEAL_SWAP)
-                    + HistoryDealGetDouble(dealTicket, DEAL_COMMISSION)
-                    + HistoryDealGetDouble(dealTicket, DEAL_FEE);
+        positionNet = thisDealNet; // fallback: at least this deal's own numbers
     }
 
-    g_DailyProfit += positionNet;
     RegisterClosedDealResult(positionNet);
 }
 
@@ -951,11 +1097,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    //--- explicit, race-free halt-clear request (works even if no EA
+    //--- instance was running at the moment it was set)
+    ProcessResetRequestIfAny();
+
     //--- drawdown kill-switch — checked first, overrides everything else.
-    //--- If the halt was active last tick but is gone now, a human just
-    //--- cleared it: rebase the peak to current equity so resuming
-    //--- doesn't immediately retrigger the halt (equity is virtually
-    //--- always still below the OLD peak right after a halt).
+    //--- If the halt was active last tick but is gone now (bare deletion
+    //--- of the halt variable, observed live by this running instance),
+    //--- rebase the peak to current equity so resuming doesn't
+    //--- immediately retrigger the halt.
     bool haltedNow = IsDrawdownHalted();
     if(g_WasHalted && !haltedNow)
     {
@@ -1048,7 +1198,7 @@ void OnTick()
 
     double Ask = GetAsk();
     double Bid = GetBid();
-    if(Ask <= 0 || Bid <= 0)
+    if(!MathIsValidNumber(Ask) || !MathIsValidNumber(Bid) || Ask <= 0 || Bid <= 0)
     {
         Print("Wootang v8: Ask/Bid unavailable this tick — skipping signal evaluation");
         return;
@@ -1064,7 +1214,7 @@ void OnTick()
     if(EvaluateOnBarCloseOnly)
     {
         closedBarClose = iClose(_Symbol, PERIOD_CURRENT, 1);
-        if(closedBarClose <= 0)
+        if(!ValidIndicatorValue(closedBarClose))
         {
             Print("Wootang v8: closed-bar Close price unavailable this tick — skipping signal evaluation");
             return;
@@ -1072,20 +1222,21 @@ void OnTick()
     }
 
     //--- Both bands are fetched upfront and validated together. This closes
-    //--- a real gap in the original v7 SELL condition: GetBand() returns 0
-    //--- on a failed/insufficient-history read or an EMPTY_VALUE (not yet
-    //--- calculated), and `(20pts + 0) >= Bid` is FALSE for any real price
-    //--- — meaning the "no signal" gate would silently fail OPEN and place
-    //--- a SellStop purely because the indicator read failed, not because
-    //--- of a real signal. The BUY side happened to fail closed by
-    //--- coincidence of its inequality direction, but is checked here too
-    //--- for symmetry and because closed-bar mode's iClose() reference can
-    //--- independently fail to 0 as well.
+    //--- a real gap in the original v7 SELL condition: GetBand() can return
+    //--- 0 on a failed/insufficient-history read, EMPTY_VALUE (not yet
+    //--- calculated), or NaN, and `(20pts + <any of those>) >= Bid` is
+    //--- FALSE for any real price — meaning the "no signal" gate would
+    //--- silently fail OPEN and place a SellStop purely because the
+    //--- indicator read failed, not because of a real signal. The BUY side
+    //--- happened to fail closed by coincidence of its inequality
+    //--- direction, but is checked here too for symmetry and because
+    //--- closed-bar mode's iClose() reference can independently fail too.
+    //--- Also rejects an inverted/degenerate band (lower >= upper).
     double lowerBandRef = GetBand(2, EvaluateOnBarCloseOnly ? 1 : 0);
     double upperBandRef = GetBand(1, EvaluateOnBarCloseOnly ? 1 : 0);
-    if(lowerBandRef <= 0 || upperBandRef <= 0)
+    if(!ValidIndicatorValue(lowerBandRef) || !ValidIndicatorValue(upperBandRef) || lowerBandRef >= upperBandRef)
     {
-        Print("Wootang v8: Bollinger Band value unavailable this tick — skipping signal evaluation");
+        Print("Wootang v8: Bollinger Band value unavailable/invalid this tick — skipping signal evaluation");
         return;
     }
 
@@ -1103,11 +1254,19 @@ void OnTick()
     // ── ENTRY LOGIC UNCHANGED FROM v7 (when EvaluateOnBarCloseOnly=false) ─
     if(((lowerBandRef - (_Point * 20)) > buyRefPrice) && g_LastBars != currentBars)
     {
-        // Clean any stale pending orders unconditionally before placing
-        DeleteAllPending();
+        // Clean any stale pending orders first. If any deletion isn't
+        // server-confirmed, abort rather than risk placing this new
+        // BuyStop alongside an old, still-resting order — this EA's
+        // one-order-at-a-time design depends on that never happening.
+        if(!DeleteAllPending())
+        {
+            Print("Wootang v8: new BuyStop entry aborted — a stale pending order could not be confirmed removed");
+            g_LastBars = currentBars;
+            return;
+        }
 
         double price = NormalizeToTick(Ask + (_Point * 30));
-        double sl    = StopLoss   > 0 ? NormalizeToTick(price - (StopLoss   * _Point)) : 0;
+        double sl    = NormalizeToTick(price - (StopLoss   * _Point)); // StopLoss > 0 guaranteed by ValidateInputs()
         double tp    = TakeProfit > 0 ? NormalizeToTick(price + (TakeProfit * _Point)) : 0;
 
         if(!PendingDistancesOk(price, sl, tp, Ask))
@@ -1117,7 +1276,7 @@ void OnTick()
             return;
         }
 
-        double lots = LotsCalculation(StopLoss);
+        double lots = LotsCalculation(ORDER_TYPE_BUY, price, sl);
         if(lots <= 0)
         {
             g_LastBars = currentBars;
@@ -1143,13 +1302,19 @@ void OnTick()
     if(((_Point * 20) + upperBandRef) >= sellRefPrice) return;
     if(g_LastBars == currentBars) return;
 
-    // Clean any stale pending orders unconditionally before placing
-    DeleteAllPending();
+    // Clean any stale pending orders first; abort on an unconfirmed
+    // deletion for the same reason as the BUY side above.
+    if(!DeleteAllPending())
+    {
+        Print("Wootang v8: new SellStop entry aborted — a stale pending order could not be confirmed removed");
+        g_LastBars = currentBars;
+        return;
+    }
 
     if(Bid > (_Point * 50))
     {
         double price = NormalizeToTick(Bid - (_Point * 30));
-        double sl    = StopLoss   > 0 ? NormalizeToTick(price + (StopLoss   * _Point)) : 0;
+        double sl    = NormalizeToTick(price + (StopLoss   * _Point)); // StopLoss > 0 guaranteed by ValidateInputs()
         double tp    = TakeProfit > 0 ? NormalizeToTick(price - (TakeProfit * _Point)) : 0;
 
         if(!PendingDistancesOk(price, sl, tp, Bid))
@@ -1159,7 +1324,7 @@ void OnTick()
             return;
         }
 
-        double lots = LotsCalculation(StopLoss);
+        double lots = LotsCalculation(ORDER_TYPE_SELL, price, sl);
         if(lots <= 0)
         {
             g_LastBars = currentBars;
