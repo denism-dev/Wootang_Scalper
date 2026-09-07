@@ -119,3 +119,39 @@ question above in the Strategy Tester instead of committing to one answer:
 Turning it on changes trade timing and frequency versus v7, so it's meant
 to be compared against the default in testing, not assumed to be strictly
 better.
+
+## v8.5 — review fixes on v8.4
+
+A further review pass found the closed-bar toggle itself had a bookkeeping
+gap, plus three live-trading robustness issues:
+
+- **Closed-bar bookkeeping now decoupled from every other gate.** The
+  previous "already evaluated this bar" check only got updated from inside
+  the signal branches, so an early return (open position, cooldown,
+  session, spread, ATR) left it stale. Concretely: a position open at the
+  start of a bar, closing mid-bar, could let the EA evaluate that bar's
+  closed-bar signal several minutes late, on stale data. A separate
+  tracker (`g_LastClosedEvalBars`) now marks the bar's one evaluation
+  opportunity as used the instant a new bar is detected — before
+  `HasOpenPosition()` or any filter runs — so the decision point is fixed
+  regardless of what happens afterward.
+- **Pending orders now explicitly request `ORDER_FILLING_RETURN`.**
+  `SetTypeFillingBySymbol()` can select FOK or IOC depending on what the
+  symbol advertises, but RETURN is the conventional filling mode for
+  stop/limit-type pending orders on many brokers. `BuyStop`/`SellStop` now
+  set RETURN explicitly right before sending; `CloseAll()` explicitly
+  restores `SetTypeFillingBySymbol()` before closing positions, since the
+  same `CTrade` object is shared between both kinds of request.
+- **Trade results are now actually verified.** `BuyStop()`/`SellStop()`
+  returning `true` only means the request passed local validation, not
+  that the broker accepted it. Both calls now log
+  `ResultRetcode()`/`ResultOrder()` via a new `LogOrderResult()` helper, so
+  a rejection (bad filling mode, invalid stops, insufficient margin, market
+  restrictions) shows up as a clear log line instead of looking like "no
+  signal fired."
+- **Drawdown halt/peak are now scoped to the account, not just shared.**
+  MT5 global variables are shared by every program running in a terminal
+  instance regardless of which account is logged in, so the v8.3 unscoped
+  names could let a halt or equity peak from one account leak into a
+  different account later logged into the same terminal. They're now keyed
+  by `ACCOUNT_LOGIN`.

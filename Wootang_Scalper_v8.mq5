@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Wootang Scalper v8.4 — MT5                                       |
+//| Wootang Scalper v8.5 — MT5                                       |
 //| Copyright © 2026, wootang Technologies Inc                       |
 //| https://www.mql5.com/en                                          |
 //+------------------------------------------------------------------+
@@ -49,11 +49,40 @@
 //  ones; order placement still uses live Ask/Bid either way. This
 //  materially changes trade timing/frequency versus v7 and is meant to
 //  be A/B tested in the Strategy Tester, not left on by default.
+//
+//  v8.5 fixes a review pass on v8.4:
+//  - The EvaluateOnBarCloseOnly gate (`g_LastBars == currentBars`) only
+//    got updated from inside the signal branches, so an early return
+//    (open position, cooldown, session, spread, ATR) left it stale —
+//    a position closing mid-candle, or a filter clearing mid-candle,
+//    could let the EA act on stale closed-bar data well after the bar
+//    that produced the signal had closed. A separate tracker
+//    (g_LastClosedEvalBars) now marks the bar's one evaluation
+//    opportunity as used immediately when a new bar is detected,
+//    before any filter or the one-trade lock can suppress it.
+//  - Pending BuyStop/SellStop orders now explicitly request
+//    ORDER_FILLING_RETURN, since SetTypeFillingBySymbol() can select
+//    FOK/IOC (whichever the symbol advertises first) which isn't the
+//    conventional filling mode for stop-type pending orders on many
+//    brokers. CloseAll() explicitly restores SetTypeFillingBySymbol()
+//    for market position closes, since the same CTrade object is used
+//    for both.
+//  - BuyStop()/SellStop() returning true only means the request passed
+//    local validation, not that the broker accepted it. Both calls now
+//    log ResultRetcode()/ResultOrder() via LogOrderResult() so a
+//    rejection (bad filling mode, invalid stops, margin, market
+//    restrictions) is visible instead of looking like "no signal".
+//  - The drawdown halt/peak global variables are now scoped by
+//    ACCOUNT_LOGIN. MT5 global variables are shared by every program
+//    in a terminal instance regardless of which account is logged in,
+//    so the previous unscoped names could let a halt/peak from one
+//    account leak into a different account later logged into the same
+//    terminal.
 //+------------------------------------------------------------------+
 
 #property copyright "Copyright © 2026, wootang Technologies Inc"
 #property link      "https://www.mql5.com/en"
-#property version   "8.4"
+#property version   "8.5"
 #property description "Wootang Scalper MT5 — one trade at a time with TP/SL and a risk-management layer"
 
 #include <Trade\Trade.mqh>
@@ -117,17 +146,23 @@ COrderInfo    ordInfo;
 int g_BandsHandle = INVALID_HANDLE;
 int g_ATRHandle   = INVALID_HANDLE;
 
-//--- bar tracker — prevents multiple signals on the same bar
-int g_LastBars = 0;
+//--- bar trackers
+int g_LastBars          = 0; // intrabar mode: prevents multiple entries on the same bar
+int g_LastClosedEvalBars = 0; // closed-bar mode: marks this bar's one evaluation opportunity as used
 
 //--- daily profit tracking
 double g_DailyProfit = 0;
 int    g_LastDay     = -1;
 
-//--- drawdown kill-switch (account-wide: shared, unkeyed global variables)
-double g_EquityPeak    = 0;
-string g_HaltVarName    = "Wootang_AccountHalt";
-string g_PeakVarName    = "Wootang_AccountEquityPeak";
+//--- drawdown kill-switch (account-wide across every chart, but scoped to
+//--- THIS account login — MT5 global variables are shared by every program
+//--- in the terminal instance regardless of which account is logged in, so
+//--- an unscoped name would let a halt from one account leak into another
+//--- if the terminal is later logged into a different account). Set in
+//--- OnInit once ACCOUNT_LOGIN is known.
+double g_EquityPeak   = 0;
+string g_HaltVarName  = "";
+string g_PeakVarName  = "";
 
 //--- losing-streak cooldown
 int      g_ConsecutiveLosses = 0;
@@ -218,6 +253,7 @@ void DeleteAllPending()
 //+------------------------------------------------------------------+
 void CloseAll()
 {
+    trade.SetTypeFillingBySymbol(_Symbol); // market close — not the RETURN mode pending orders use
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
         if(posInfo.SelectByIndex(i)
@@ -278,6 +314,26 @@ void ApplyTrailingStop()
 }
 
 //+------------------------------------------------------------------+
+//| A `true` return from trade.BuyStop()/SellStop() only means the   |
+//| request passed local/client-side validation — it does NOT mean   |
+//| the broker actually accepted and placed the order. Always check  |
+//| ResultRetcode()/ResultOrder() too, so a rejection (bad filling    |
+//| mode, invalid stops, insufficient margin, market restrictions)   |
+//| shows up as a clear log line instead of looking like "no signal".|
+//+------------------------------------------------------------------+
+void LogOrderResult(const string label, bool sent)
+{
+    uint  retcode = trade.ResultRetcode();
+    ulong order   = trade.ResultOrder();
+    bool  ok      = sent && order != 0
+                     && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED);
+    if(!ok)
+        Print("Wootang v8: ", label, " NOT confirmed placed. sent=", sent,
+              " order=", order, " retcode=", retcode,
+              " (", trade.ResultRetcodeDescription(), ")");
+}
+
+//+------------------------------------------------------------------+
 //| Validate that a pending order's price and SL/TP respect the      |
 //| broker's minimum stop distance before it is sent.                |
 //+------------------------------------------------------------------+
@@ -334,14 +390,18 @@ void CheckDayRollover()
 }
 
 //+------------------------------------------------------------------+
-//| Drawdown kill-switch. g_HaltVarName / g_PeakVarName are shared,  |
-//| UNKEYED global variables — every chart running this EA (whatever |
-//| its own symbol or magic) reads the same halt flag and the same   |
-//| equity peak, so the halt is genuinely account-wide. Each instance|
-//| only ever closes its OWN (symbol+magic) trades via CloseAll() —  |
-//| it never reaches into another instance's positions directly; the |
-//| shared flag is what makes every other instance halt itself too,  |
-//| on its own next tick.                                             |
+//| Drawdown kill-switch. g_HaltVarName / g_PeakVarName are shared    |
+//| global variables, keyed only by ACCOUNT_LOGIN (not by symbol or   |
+//| magic — see OnInit) — every chart running this EA under the SAME  |
+//| account reads the same halt flag and the same equity peak, so the |
+//| halt is genuinely account-wide. Each instance only ever closes    |
+//| its OWN (symbol+magic) trades via CloseAll() — it never reaches   |
+//| into another instance's positions directly; the shared flag is    |
+//| what makes every other instance halt itself too, on its own next  |
+//| tick. Keying by account prevents a halt/peak from one account     |
+//| leaking into a different account later logged into the same       |
+//| terminal instance (global variables aren't otherwise account-     |
+//| scoped).                                                            |
 //|                                                                    |
 //| The halt does NOT clear on an EA reload or terminal restart — MT5|
 //| global variables persist across both. Only deleting the global   |
@@ -577,11 +637,19 @@ int OnInit()
         return INIT_FAILED;
     }
 
-    g_LastBars          = 0;
-    g_DailyProfit       = 0;
-    g_LastDay           = -1;
-    g_ConsecutiveLosses = 0;
-    g_CooldownUntil     = 0;
+    g_LastBars           = 0;
+    g_LastClosedEvalBars = 0;
+    g_DailyProfit        = 0;
+    g_LastDay            = -1;
+    g_ConsecutiveLosses  = 0;
+    g_CooldownUntil      = 0;
+
+    // Global variables are shared by every program in this terminal instance
+    // regardless of which account is logged in, so scope them to the current
+    // account login to avoid a halt/peak from one account leaking into another.
+    long login = AccountInfoInteger(ACCOUNT_LOGIN);
+    g_HaltVarName = StringFormat("Wootang_AccountHalt_%I64d", login);
+    g_PeakVarName = StringFormat("Wootang_AccountEquityPeak_%I64d", login);
 
     double storedPeak = GlobalVariableCheck(g_PeakVarName) ? GlobalVariableGet(g_PeakVarName) : 0;
     g_EquityPeak = MathMax(storedPeak, AccountInfoDouble(ACCOUNT_EQUITY));
@@ -591,7 +659,7 @@ int OnInit()
         Print("Wootang v8: loaded with an ACTIVE account-wide drawdown halt ('", g_HaltVarName,
               "'). No new trades will be placed until it is cleared.");
 
-    Print("Wootang Scalper v8.4 started. TP=", TakeProfit, "pts  SL=", StopLoss,
+    Print("Wootang Scalper v8.5 started. TP=", TakeProfit, "pts  SL=", StopLoss,
           "pts  Trail=", TrailingStop, "pts  Sizing=",
           SizingMode == SIZING_RISK_PERCENT ? DoubleToString(RiskPercent, 2) + "% equity risk"
                                              : "fixed lot " + DoubleToString(uLotsValue, 2),
@@ -666,6 +734,26 @@ void OnTick()
         }
     }
 
+    //--- Bar bookkeeping for EvaluateOnBarCloseOnly is done here, BEFORE any
+    //--- filter or lock can return early, so the bar's one evaluation
+    //--- opportunity is marked "used" the instant a new bar appears —
+    //--- regardless of whether a position is open, a filter blocks entry,
+    //--- or a trade actually gets placed. Without this, an early return
+    //--- (open position, cooldown, session, spread, ATR) would leave the
+    //--- bar unmarked, letting the EA act on stale closed-bar data late —
+    //--- e.g. a position closing mid-candle, or a filter clearing mid-
+    //--- candle, could trigger an entry several minutes after the bar
+    //--- that produced the signal actually closed. g_LastBars (used below)
+    //--- is a separate tracker that keeps intrabar mode's own "at most once
+    //--- per bar" dedup exactly as it was in v7.
+    int  currentBars       = iBars(_Symbol, PERIOD_CURRENT);
+    bool closedBarEvalNow  = false;
+    if(EvaluateOnBarCloseOnly && g_LastClosedEvalBars != currentBars)
+    {
+        g_LastClosedEvalBars = currentBars;
+        closedBarEvalNow     = true;
+    }
+
     //--- trail any open position regardless of whether a new entry follows
     ApplyTrailingStop();
 
@@ -679,6 +767,11 @@ void OnTick()
     //--- regardless of whether a new entry is about to be evaluated
     MaintainPendingOrders();
 
+    //--- closed-bar mode: this bar's one evaluation opportunity is already
+    //--- used up (either by this exact tick, marked above, or an earlier
+    //--- tick this same bar) — don't re-evaluate on later ticks.
+    if(EvaluateOnBarCloseOnly && !closedBarEvalNow) return;
+
     //--- losing-streak cooldown
     if(InCooldown()) return;
 
@@ -691,20 +784,15 @@ void OnTick()
     //--- volatility regime filter
     if(!VolatilityOk()) return;
 
-    double Ask         = GetAsk();
-    double Bid         = GetBid();
-    int    currentBars = iBars(_Symbol, PERIOD_CURRENT);
+    double Ask = GetAsk();
+    double Bid = GetBid();
 
-    //--- EvaluateOnBarCloseOnly toggle: when on, only evaluate the signal
-    //--- once, on the first tick of a new bar, using the LAST CLOSED bar's
+    //--- EvaluateOnBarCloseOnly toggle: when on, use the LAST CLOSED bar's
     //--- band and close price as the reference instead of the live/forming
     //--- ones. Order placement still uses live Ask/Bid either way — this
     //--- only changes when/what decides whether to place the order. Off by
     //--- default, which preserves the original intrabar v7 behaviour
     //--- exactly (buffer shift 0, live Ask/Bid).
-    if(EvaluateOnBarCloseOnly && g_LastBars == currentBars)
-        return;
-
     double lowerBandRef = GetBand(2, EvaluateOnBarCloseOnly ? 1 : 0);
     double buyRefPrice  = EvaluateOnBarCloseOnly ? iClose(_Symbol, PERIOD_CURRENT, 1) : Ask;
 
@@ -740,9 +828,10 @@ void OnTick()
             return; // sizing said skip — see LotsCalculation()
         }
 
-        if(!trade.BuyStop(lots, price, _Symbol, sl, tp,
-                           ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
-            Print("Wootang v8: BuyStop failed err=", GetLastError());
+        trade.SetTypeFilling(ORDER_FILLING_RETURN); // pending orders: RETURN, not FOK/IOC
+        bool sent = trade.BuyStop(lots, price, _Symbol, sl, tp,
+                                   ORDER_TIME_GTC, 0, "Wootang Scalper v8");
+        LogOrderResult("BuyStop", sent);
 
         g_LastBars = currentBars;
         return;
@@ -783,9 +872,10 @@ void OnTick()
             return; // sizing said skip — see LotsCalculation()
         }
 
-        if(!trade.SellStop(lots, price, _Symbol, sl, tp,
-                            ORDER_TIME_GTC, 0, "Wootang Scalper v8"))
-            Print("Wootang v8: SellStop failed err=", GetLastError());
+        trade.SetTypeFilling(ORDER_FILLING_RETURN); // pending orders: RETURN, not FOK/IOC
+        bool sent = trade.SellStop(lots, price, _Symbol, sl, tp,
+                                     ORDER_TIME_GTC, 0, "Wootang Scalper v8");
+        LogOrderResult("SellStop", sent);
     }
     g_LastBars = currentBars;
 }
